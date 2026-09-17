@@ -479,10 +479,17 @@ struct AIEGenerateColumnControlOverlayPass
     return attr && !attr.getValue();
   }
 
+  // Looped-dest form: one aie.packet_flow with one aie.packet_source and a
+  // loop of aie.packet_dest, one per tile in `dests` (all sharing destBundle /
+  // destChannel). Mirrors AIEObjectFifoAllocate.cpp lowerPacketFlow (one
+  // source, loop of dests). A single-element `dests` reproduces the prior
+  // single-dest emission byte for byte; grouping multiple dests is the
+  // multicast case (Task 4).
   AIE::PacketFlowOp createPacketFlowOp(OpBuilder &builder, Location loc,
                                        int &flowID, Value source,
                                        xilinx::AIE::WireBundle sourceBundle,
-                                       uint32_t sourceChannel, Value dest,
+                                       uint32_t sourceChannel,
+                                       ArrayRef<Value> dests,
                                        xilinx::AIE::WireBundle destBundle,
                                        uint32_t destChannel,
                                        mlir::BoolAttr keep_pkt_header = nullptr,
@@ -496,9 +503,27 @@ struct AIEGenerateColumnControlOverlayPass
     builder.setInsertionPointToStart(b_pktFlow);
     AIE::PacketSourceOp::create(builder, loc, source, sourceBundle,
                                 sourceChannel);
-    AIE::PacketDestOp::create(builder, loc, dest, destBundle, destChannel);
+    for (Value dest : dests)
+      AIE::PacketDestOp::create(builder, loc, dest, destBundle, destChannel);
     AIE::EndOp::create(builder, loc);
     return pktFlow;
+  }
+
+  // Single-dest form: delegates to the looped-dest variant with a one-element
+  // dest list. Keeps existing callers unchanged.
+  AIE::PacketFlowOp createPacketFlowOp(OpBuilder &builder, Location loc,
+                                       int &flowID, Value source,
+                                       xilinx::AIE::WireBundle sourceBundle,
+                                       uint32_t sourceChannel, Value dest,
+                                       xilinx::AIE::WireBundle destBundle,
+                                       uint32_t destChannel,
+                                       mlir::BoolAttr keep_pkt_header = nullptr,
+                                       mlir::BoolAttr ctrl_pkt_flow = nullptr) {
+    Value destList[] = {dest};
+    return createPacketFlowOp(builder, loc, flowID, source, sourceBundle,
+                              sourceChannel, ArrayRef<Value>(destList),
+                              destBundle, destChannel, keep_pkt_header,
+                              ctrl_pkt_flow);
   }
 
   // Result of a shim-channel occupancy scan: `availableShimChans` lists
@@ -613,6 +638,20 @@ struct AIEGenerateColumnControlOverlayPass
     return -1;
   }
 
+  // Partition the column's control tiles into multicast groups: every tile in
+  // a group shares one control packet flow (one source, looped dests). Default
+  // (this task) is the identity grouping -- one tile per group -- so each
+  // group lowers to a single-dest flow, byte-identical to the per-tile
+  // emission. Task 4 makes the grouping configurable to fold multiple tiles
+  // into one multicast flow.
+  static SmallVector<SmallVector<AIE::TileOp>>
+  groupControlTiles(const SmallVector<AIE::TileOp> &ctrlTiles) {
+    SmallVector<SmallVector<AIE::TileOp>> groups;
+    for (auto tOp : ctrlTiles)
+      groups.push_back({tOp});
+    return groups;
+  }
+
   // Create packet flows per col which moves control packets to and from shim
   // dma
   LogicalResult generatePacketFlowsForControl(
@@ -698,7 +737,16 @@ struct AIEGenerateColumnControlOverlayPass
     }
 
     builder.setInsertionPoint(device.getBody()->getTerminator());
-    for (auto tOp : ctrlTiles) {
+    // Emit one control flow (and, for the ingress leg, one shim alloc) per
+    // group. The identity grouping makes each group a single tile, so the
+    // representative tile below is that one tile and the emission is
+    // byte-identical to the former per-tile loop.
+    auto ctrlTileGroups = groupControlTiles(ctrlTiles);
+    for (auto &group : ctrlTileGroups) {
+      // Representative tile: drives the flow id, shim-channel choice, and the
+      // shim allocation. For the identity grouping it is the group's only
+      // tile.
+      AIE::TileOp tOp = group.front();
       if (tOp->hasAttr("controller_id"))
         ctrlPktFlowID =
             (int)tOp->getAttrOfType<AIE::PacketInfoAttr>("controller_id")
@@ -750,12 +798,18 @@ struct AIEGenerateColumnControlOverlayPass
 
       auto keep_pkt_header = builder.getBoolAttr(true);
       auto ctrl_pkt_flow = builder.getBoolAttr(true);
-      if (isShimMM2S)
+      if (isShimMM2S) {
+        // Ingress leg: one shim source multicasts to every tile in the group.
+        // For the identity grouping this is the single representative tile, so
+        // the emitted dest is identical to the former single-dest call.
+        SmallVector<Value> ctrlDests;
+        for (auto ct : group)
+          ctrlDests.push_back(ct.getResult());
         (void)createPacketFlowOp(builder, tOp.getLoc(), ctrlPktFlowID, shimTile,
-                                 shimWireBundle, chosenChan, tOp,
+                                 shimWireBundle, chosenChan, ctrlDests,
                                  ctrlWireBundle, coreOrMemChanId,
                                  keep_pkt_header, ctrl_pkt_flow);
-      else
+      } else
         (void)createPacketFlowOp(builder, tOp.getLoc(), ctrlPktFlowID, tOp,
                                  ctrlWireBundle, coreOrMemChanId, shimTile,
                                  shimWireBundle, chosenChan, keep_pkt_header,
