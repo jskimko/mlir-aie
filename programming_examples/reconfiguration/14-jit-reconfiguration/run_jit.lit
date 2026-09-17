@@ -1,0 +1,20 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// The jit-path counterpart to the 01-13 overlay rungs: folds @iron.jit designs
+// with iron.Reconfiguration and dispatches the result via pyxrt.runlist (no
+// Makefile/gen.py/C++ host). Exercises all three reconfig-method deliveries,
+// each covering both a single-design fold and a multi-design fold.
+//
+// RUN: %run_on_npu2% %python %S/jit_reconfiguration.py --method ctrlpkt | FileCheck %s --check-prefix=CTRLPKT
+// RUN: %run_on_npu2% %python %S/jit_reconfiguration.py --method write32 | FileCheck %s --check-prefix=WRITE32
+// RUN: %run_on_npu2% %python %S/jit_reconfiguration.py --method loadpdi | FileCheck %s --check-prefix=LOADPDI
+//
+// CTRLPKT: PASS: single-design fold (method=ctrlpkt)
+// CTRLPKT: PASS: multi-design fold (method=ctrlpkt)
+// WRITE32: PASS: single-design fold (method=write32)
+// WRITE32: PASS: multi-design fold (method=write32)
+// LOADPDI: PASS: single-design fold (method=loadpdi)
+// LOADPDI: PASS: multi-design fold (method=loadpdi)
