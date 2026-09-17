@@ -22,16 +22,43 @@ config, so `main:config_1`'s control-packet delivery targets exactly ONE
 destination tile -- the plain single-dest control reconfigure that later
 multicast work will diff against.
 
-`gen.py` also accepts `--fanout N` / `--depth D`, but **neither is wired into the
-emitted design yet** -- they are reserved for Task 2 (multicast delivery of the
-SAME reconfigure to `N` destination tiles over a `D`-deep distribution tree).
-Passing them here is a no-op; the design is always the single compute tile
-described above.
+`gen.py --fanout N` now emits `N` compute tiles (rows 2..1+N of column 0), each
+receiving the **SAME** reconfigure content, so ONE control-packet MULTICAST (one
+source, `N` destinations) is a valid vehicle for delivering the reconfigure.
+`--depth D` stretches the farthest destination to row `1+D` so the multicast
+trunk is `D` tiles deep (a within-column South-in / North-out spine). At the
+default `N=1` this is exactly the single-dest baseline above.
 
-This rung is **offline-only** for now: there is no host `test.cpp` / device run,
-only the `aiecc` build (`all` produces the overlay ELF + its
-`build/overlay*.prj` intermediates) and an offline grep of the emitted MLIR
-confirming the control route is single-dest.
+This rung is **offline-only**: there is no host `test.cpp` / device run. The two
+offline gates are (1) the `aiecc` build (`make ...` -> overlay ELF + its
+`build/overlay*.prj` intermediates) and (2) the masterset check below.
+
+## The multicast vehicle + masterset check (offline)
+
+`gen.py --emit-ctrl-spine` emits the multicast VEHICLE as a standalone, hand-
+authored control spine -- ONE `aie.packet_flow` with a single
+`aie.packet_source<shim, DMA>` fanning out to `N` `aie.packet_dest<tile_j,
+TileControl>` (all sharing flow id 1, `keep_pkt_header` + `priority_route` true),
+modeled verbatim on `test/dialect/AIE/freeze_design_aware_coherent.mlir` but
+parameterized by `N`. The control route is **hand-authored** (not the overlay
+pass's auto-generated single-dest-per-tile routes) so the multicast does not
+depend on the undesigned overlay multi-dest emission path.
+
+```sh
+make -C programming_examples/reconfiguration/19-ctrl-multicast-bench checkspine FANOUT=4
+make -C programming_examples/reconfiguration/19-ctrl-multicast-bench spinesweep SPINE_SWEEP="1 2 4 8"
+```
+
+`checkspine` lowers the spine through the SAME control-freeze + pathfinder passes
+the reconfigure flow uses (`--aie-freeze-control-fabric=design-aware=true
+--aie-create-pathfinder-flows`) and proves the `N` destinations collapse onto
+**ONE** `is_ctrl_pkt_overlay` masterset at the shim (a genuine switchbox
+multicast with farthest-first trunk reuse, NOT `N` unicast routes) -- via
+FileCheck against the spine's embedded CHECK lines when FileCheck is on `PATH`,
+and always via a portable grep assertion (one shim North master, `N` TileControl
+masters). A within-column multicast on npu2 (AIE2P: rows 2..5 are the 4 core
+rows) tops out at `N=4`; `N=8` fails to place (row 6 exceeds the column) -- a
+first-class finding, not a silent clamp.
 
 ## Build
 
@@ -44,13 +71,13 @@ intermediates (no device run). `METHOD` may also be `loadpdi` or `write32` (the
 other union-overlay arms); this rung does not implement the whole-context
 `cold`/`warm` arms (out of scope for a control-packet multicast microbench).
 
-## Verifying the single-dest control route (offline)
+## The auto-generated overlay route (offline, baseline reference)
 
-No new tooling: `aiecc --dump-intermediates` (already invoked above) drops the
-emitted MLIR at every pipeline stage under `build/overlay_1_ctrlpkt.prj/`. The
-config's own device sub-module (`@config_1_config`) contains exactly ONE
-`aie.packet_dest<%tile_0_2, TileControl : 0>` -- one control-packet flow, one
-destination tile:
+`aiecc --dump-intermediates` (invoked by `all`) drops the emitted MLIR at every
+pipeline stage under `build/overlay_1_ctrlpkt.prj/`. At `N=1` the config's own
+device sub-module (`@config_1_config`) contains exactly ONE
+`aie.packet_dest<%tile_0_2, TileControl : 0>` -- the overlay pass's
+auto-generated single-dest control route to the one compute tile:
 
 ```sh
 sed -n '/aie.device(npu2) @config_1_config/,/aie.device(npu2) @ctrl_pkt_overlay/p' \
@@ -66,7 +93,7 @@ identically in every ctrlpkt-method rung -- which is why the same
 un-scoped; isolating the `@config_1_config` sub-module is what narrows the count
 to the one flow this DESIGN actually uses.)
 
-Task 2 multicasting `N>1` destinations from one source is expected to change
-this from one `aie.packet_flow` per destination to one `aie.packet_flow` with
-`N` `aie.packet_dest` entries sharing a single source -- this rung's N=1 count
-is the reference the multicast task diffs against.
+That auto-generated route is single-dest-per-tile (one `aie.packet_flow` per
+destination). The hand-authored multicast vehicle above is the contrast: one
+`aie.packet_flow` with `N` `aie.packet_dest` entries sharing a single source,
+proven (via `make checkspine`) to lower to one coherent shim masterset.

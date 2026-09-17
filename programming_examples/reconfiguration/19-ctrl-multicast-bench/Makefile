@@ -51,3 +51,50 @@ $(BUILDDIR)/$(overlay_elf): $(CONFIG_DESIGNS)
 	$(Q)cd $(BUILDDIR) && aiecc $(aiecc_flags) $(overlay_sel) \
 	  --full-elf-name=$(overlay_elf) --dump-intermediates --tmpdir=$(overlay_prj) \
 	  --output-dir=. $(notdir $(CONFIG_DESIGNS))
+
+# ---------------------------------------------------------------------------
+# Offline masterset check for the hand-authored control MULTICAST spine (Step 3
+# of the multicast task). gen.py --emit-ctrl-spine emits the standalone one-
+# packet_flow / N-TileControl-dest vehicle plus its RUN/CHECK lines; we lower it
+# through the SAME control-freeze + pathfinder passes the reconfigure flow uses
+# and prove the N destinations collapse onto ONE is_ctrl_pkt_overlay masterset at
+# the shim (a genuine switchbox multicast, NOT N unicast routes). Uses FileCheck
+# when discoverable (the embedded CHECK lines), and always runs a portable
+# grep-based assertion so the check is self-contained.
+SPINE_PASSES := --aie-freeze-control-fabric="design-aware=true" --aie-create-pathfinder-flows
+FILECHECK    := $(firstword $(wildcard $(dir $(shell command -v aie-opt))FileCheck) \
+                            $(shell command -v FileCheck 2>/dev/null) \
+                            $(wildcard $(srcdir)/../../../my_install/mlir/bin/FileCheck))
+
+.PHONY: checkspine spinesweep
+checkspine:
+	@mkdir -p $(BUILDDIR)
+	@echo "==>  spine    fanout=$(FANOUT) depth=$(DEPTH)  (multicast masterset check)"
+	$(Q)python3 gen.py --fanout $(FANOUT) --depth $(DEPTH) --dev $(DEV) --emit-ctrl-spine \
+	  > $(BUILDDIR)/spine_f$(FANOUT).mlir
+	$(Q)aie-opt $(BUILDDIR)/spine_f$(FANOUT).mlir $(SPINE_PASSES) \
+	  > $(BUILDDIR)/spine_f$(FANOUT).lowered.mlir
+	$(Q)ndest=$$(grep -c 'packet_dest<.*TileControl' $(BUILDDIR)/spine_f$(FANOUT).mlir); \
+	  nshim=$$(awk '/switchbox\(%shim_noc_tile_0_0\)/{f=1} f&&/packet_rules/{f=0} f&&/masterset\(North.*is_ctrl_pkt_overlay/{c++} END{print c+0}' $(BUILDDIR)/spine_f$(FANOUT).lowered.mlir); \
+	  ntc=$$(grep -c 'masterset(TileControl : 0,.*is_ctrl_pkt_overlay' $(BUILDDIR)/spine_f$(FANOUT).lowered.mlir); \
+	  echo "     dests=$$ndest  shim-North-mastersets=$$nshim  TileControl-mastersets=$$ntc"; \
+	  if [ "$$nshim" = "1" ] && [ "$$ntc" = "$$ndest" ]; then \
+	    echo "     GREP-PROOF: PASS (one coherent trunk, all $$ndest dests reached)"; \
+	  else \
+	    echo "     GREP-PROOF: FAIL (expected 1 shim master and $$ndest TileControl masters)"; exit 1; \
+	  fi
+	$(Q)if [ -x "$(FILECHECK)" ]; then \
+	    aie-opt $(BUILDDIR)/spine_f$(FANOUT).mlir $(SPINE_PASSES) \
+	      | "$(FILECHECK)" $(BUILDDIR)/spine_f$(FANOUT).mlir \
+	      && echo "     FILECHECK:  PASS"; \
+	  else echo "     FILECHECK:  skipped (FileCheck not found; grep-proof stands)"; fi
+
+# Sweep the fan-out width: build the reconfigure design AND run the masterset
+# check at each point. A build/route FAILURE at some N is a first-class finding
+# (an oversized fan-out exceeds the npu2 column height / shim channels).
+SPINE_SWEEP ?= 1 2 4 8
+spinesweep:
+	@for f in $(SPINE_SWEEP); do \
+	  echo "======== FANOUT=$$f ========"; \
+	  $(MAKE) --no-print-directory FANOUT=$$f checkspine || true; \
+	done
