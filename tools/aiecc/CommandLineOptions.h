@@ -161,6 +161,19 @@ inline cl::opt<bool> loadPdiToCtrlPkt(
              "the device configuration as control packets (requires a control "
              "overlay; implies --generate-ctrl-pkt-overlay; mutually exclusive "
              "with --expand-load-pdis)"));
+// Overlay control-broadcast grouping (forwarded to the column-control-overlay
+// pass's `control-broadcast` option). Default "off" is the identity grouping
+// (one single-dest control flow per tile, byte-identical to before this flag);
+// "within-col" folds a column's controlled compute tiles onto ONE multi-dest
+// control packet_flow (a within-column vertical multicast spine). Only the
+// MM2S/ingress delivery leg is folded; shim/memtile control and the S2MM/TCT
+// completion leg stay per-tile. No-op outside the ctrl-pkt-overlay flow.
+inline cl::opt<std::string> controlBroadcast(
+    "control-broadcast",
+    cl::desc("Overlay control-broadcast grouping (off|within-col). Default off "
+             "is per-tile single-dest emission; within-col folds a column's "
+             "compute tiles onto one multi-dest control packet_flow."),
+    cl::init("off"));
 inline cl::opt<bool> xchesscc(
     "xchesscc",
     cl::desc("Compile cores with the Chess toolchain (xchesscc) instead of the "

@@ -807,6 +807,26 @@ struct AIEGenerateColumnControlOverlayPass
         // The whole column rides the single trunk channel resolved above and
         // published on the shim tile; there is no per-controlled-tile stamp.
         chosenChan = trunkChan;
+        // Only when this row's control is relocated off its fixed mandated
+        // channel onto the column trunk, record the chosen channel on the
+        // controlled tile so AIECtrlPacketToDma delivers on the same channel
+        // the overlay routed. When not relocated, AIECtrlPacketToDma's
+        // fallback recomputes the same mandated channel, so no attribute is
+        // needed -- keeping unrelocated IR (and existing tests) unperturbed.
+        //
+        // Stamp EVERY tile in the group, not just the representative: a
+        // within-col multicast group's single flow delivers to ALL its dest
+        // tiles on this one trunk channel, so AIECtrlPacketToDma must resolve
+        // each dest's (col,row) to the trunk channel too. Stamping only
+        // group.front() left the other dests to fall back to their own
+        // per-row mandated channel, so the column's control resolved to
+        // multiple shim channels and the per-column bd_chain failed loud. For
+        // the identity grouping (control-broadcast=off) each group is a single
+        // tile, so this loop is byte-identical to the former single stamp.
+        for (auto ct : group)
+          if (chosenChan != rowToShimChanMap[ct.rowIndex()])
+            ct->setAttr("ctrl_pkt_shim_chan",
+                        builder.getI32IntegerAttr(chosenChan));
       } else {
         chosenChan = rowToShimChanMap[tOp.rowIndex()];
         if (!llvm::is_contained(availableShimChans, chosenChan) &&

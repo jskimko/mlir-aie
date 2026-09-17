@@ -2,39 +2,28 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Rung 19 (ctrl-multicast bench) generator: a control-packet MULTICAST
-# delivery-latency microbench. ONE resident overlay -- shim(0,0) fans a data
-# ingress + egress leg to N compute tiles (0,2)..(0,1+N), each doing the SAME
-# pure in-core scalar out = in + ADD_K (rung 18's oracle, NO external kernel).
-# Because every destination tile receives the SAME reconfigure content, a single
-# control-packet MULTICAST (one source, N destinations) is a semantically valid
-# vehicle for delivering the reconfigure -- that is what the --fanout knob emits.
+# Rung 19 (ctrl-multicast bench) generator: the DEVICE make-or-break for
+# WITHIN-COLUMN control multicast. gen.py emits ONE resident reconfigure design:
+#   shim(0,0) --1 MM2S--> memtile(0,1) --split--> FANOUT cores (0,2)..(0,1+FANOUT)
+#   FANOUT cores --join--> memtile(0,1) --1 S2MM--> shim(0,0)
+# so column 0 has exactly ONE data ingress + one egress leg (a free shim MM2S
+# channel for the resident control overlay, no auto-packetize contention). Each
+# core does the SAME pure in-core scalar out = in + ADD_K (rung 18's oracle, NO
+# external kernel), so every controlled core receives IDENTICAL reconfigure
+# content -- the precondition that makes ONE control-packet MULTICAST (one shim
+# source, FANOUT TileControl dests) a semantically valid delivery vehicle.
 #
-# Two emission modes:
+# Built with aiecc --get-full-elf --reconfig-method=ctrlpkt --control-broadcast=
+# within-col (Task 4's overlay flag, threaded through aiecc by this rung), the
+# column's control DELIVERY leg collapses to ONE multi-dest packet_flow. The host
+# (test.cpp) sentinel-prefills each core's output, dispatches once, and asserts
+# every core's output == its expected value -- classifying all-correct (multicast
+# delivers) vs still-poison (transport-incomplete, localized per row) vs
+# wrong-value (mis-delivery). A refutation is a first-class result (P28 gating).
 #
-#   (default)          The buildable reconfigure DESIGN: N compute tiles wired to
-#                      the shim, folded into ONE overlay ELF via aiecc
-#                      --get-full-elf --reconfig-method=$(METHOD). --fanout N
-#                      scales the compute-tile count; N configs are cycled per
-#                      dispatch (main:config_1..N) exactly as the single-dest
-#                      baseline did. This is the offline BUILD gate (Step 2).
-#
-#   --emit-ctrl-spine  The multicast VEHICLE as a standalone, hand-authored
-#                      control spine: ONE aie.packet_flow with a single
-#                      aie.packet_source<shim, DMA> fanning out to N
-#                      aie.packet_dest<tile_j, TileControl> (rows 2..1+N of
-#                      column 0), keep_pkt_header + priority_route true. Modeled
-#                      verbatim on test/dialect/AIE/freeze_design_aware_coherent
-#                      .mlir but parameterized by N (and D, see --depth). Emits
-#                      its own RUN/CHECK lines so `aie-opt <freeze+pathfinder> |
-#                      FileCheck` proves the N destinations collapse onto ONE
-#                      is_ctrl_pkt_overlay masterset at the shim (the multicast
-#                      routing substrate, NOT N unicast routes). This is the R50
-#                      free lowering check (Step 3).
-#
-# The control packet_flow is HAND-AUTHORED here (not the overlay pass's
-# auto-generated single-dest-per-tile routes) so the multicast does not depend on
-# the undesigned overlay multi-dest emission path.
+# --emit-ctrl-spine (kept from the offline scaffold) emits a standalone hand-
+# authored control MULTICAST spine + its FileCheck lines, for `make checkspine`'s
+# offline masterset proof; it is independent of the device design above.
 import argparse
 import sys
 
@@ -45,12 +34,11 @@ from aie.iron import CompileTime, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import Tile
 
-CHUNK = 4  # elements per destination tile
+CHUNK = 4  # elements per core
 
 # npu2 (AIE2P): row 0 shim, row 1 memtile, rows 2..5 the four core rows. A
 # within-column control multicast can therefore reach at most 4 core tiles
-# (rows 2..5) before it runs out of column; a larger --fanout is expected to
-# fail to place/route in a single column (a first-class Step-2 finding).
+# (rows 2..5); a larger --fanout is expected to fail to place in one column.
 FIRST_CORE_ROW = 2
 NUM_CORE_ROWS = 4
 
@@ -61,67 +49,72 @@ def ctrl_multicast_bench(
     chunk: CompileTime[int] = CHUNK,
     add_k: CompileTime[int] = 11,
     cfg: CompileTime[int] = 1,
-    fanout: CompileTime[int] = 1,
+    fanout: CompileTime[int] = 2,
 ):
     dt = np.int32
-    buf_ty = np.ndarray[(chunk,), np.dtype[dt]]
+    coltot = fanout * chunk
+    col_ty = np.ndarray[(coltot,), np.dtype[dt]]
+    chunk_ty = np.ndarray[(chunk,), np.dtype[dt]]
+    offs = [chunk * r for r in range(fanout)]
 
-    fifos = []
+    # ONE shim ingress objectFifo into the column, SPLIT by the memtile into one
+    # per-core chunk stream; ONE shim egress objectFifo, JOINED from the cores.
+    # This is a single shim MM2S + single shim S2MM on column 0 (rung 18's
+    # single-input geometry), so the resident control overlay gets a free/clean
+    # shim channel and the ctrlpkt per-column bd_chain resolves to one channel.
+    of_a = ObjectFifo(col_ty, name=f"a{cfg}")
+    of_o = ObjectFifo(col_ty, name=f"o{cfg}")
+    a_sub = of_a.cons().split(
+        offs,
+        obj_types=[chunk_ty] * fanout,
+        names=[f"a{cfg}_{r}" for r in range(fanout)],
+    )
+    o_sub = of_o.prod().join(
+        offs,
+        obj_types=[chunk_ty] * fanout,
+        names=[f"o{cfg}_{r}" for r in range(fanout)],
+    )
+
     workers = []
-    for j in range(fanout):
-        of_in = ObjectFifo(buf_ty, name=f"in{cfg}_{j}")
-        of_out = ObjectFifo(buf_ty, name=f"out{cfg}_{j}")
+    for r in range(fanout):
 
-        def body(fin, fout):
-            ein = fin.acquire(1)
-            eout = fout.acquire(1)
+        def body(fa, fo):
+            ea = fa.acquire(1)
+            eo = fo.acquire(1)
             for i in range_(chunk):
-                eout[i] = ein[i] + add_k
-            fin.release(1)
-            fout.release(1)
+                eo[i] = ea[i] + add_k
+            fa.release(1)
+            fo.release(1)
 
         workers.append(
             Worker(
                 body,
-                fn_args=[of_in.cons(), of_out.prod()],
-                tile=Tile(0, FIRST_CORE_ROW + j),
+                fn_args=[a_sub[r].cons(), o_sub[r].prod()],
+                tile=Tile(0, FIRST_CORE_ROW + r),
             )
         )
-        fifos.append((of_in, of_out))
 
-    def seq(*sa):
-        # sa = N input buffers, N output buffers, then N (in_prod, out_cons)
-        # pairs. Each destination tile gets the SAME reconfigure content, so the
-        # per-tile legs are identical except for their buffer/fifo identity.
-        n = len(sa) // 4
-        bufs_in = sa[0:n]
-        bufs_out = sa[n : 2 * n]
-        rest = sa[2 * n :]
-        for k in range(n):
-            in_prod = rest[2 * k]
-            out_cons = rest[2 * k + 1]
-            in_prod.fill(bufs_in[k])
-            out_cons.drain(bufs_out[k], wait=True)
+    # Runtime sequence: ONE input buffer (coltot int32) filled to the shim
+    # ingress, ONE output buffer drained from the shim egress. Core r reads its
+    # own row slice [r*chunk:(r+1)*chunk] and writes the matching output slice,
+    # so a per-row sentinel in the host output localizes which core delivered.
+    def seq(a_in, o_out, a_prod, o_cons):
+        a_prod.fill(a_in)
+        o_cons.drain(o_out, wait=True)
 
-    rt_args = [buf_ty for _ in range(2 * fanout)]
-    for of_in, of_out in fifos:
-        rt_args += [of_in.prod(), of_out.cons()]
-
-    rt = Runtime(seq, rt_args)
+    rt = Runtime(seq, [col_ty, col_ty, of_a.prod(), of_o.cons()])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
 # ---------------------------------------------------------------------------
-# --emit-ctrl-spine: the standalone multicast vehicle (hand-authored).
+# --emit-ctrl-spine: the standalone offline multicast vehicle (hand-authored).
 # ---------------------------------------------------------------------------
 def dest_rows(fanout, depth):
     """Column-0 rows the control multicast fans out to. N=fanout core-tile
     destinations start at row 2 and climb the column (rows 2..1+N). --depth D
     (>= fanout) stretches the SPINE so the farthest destination sits at row
-    1+D, leaving a pure vertical trunk above the nearer destinations (the
-    South-in + North-out spine of length D). Returns the raw row list; rows
-    beyond the npu2 column (row > 5) are left in on purpose so an oversized
-    fanout/depth surfaces as an aie-opt placement error, not a silent clamp."""
+    1+D. Rows beyond the npu2 column (row > 5) are left in on purpose so an
+    oversized fanout/depth surfaces as an aie-opt placement error."""
     rows = [FIRST_CORE_ROW + j for j in range(fanout)]
     if depth > fanout and rows:
         rows[-1] = 1 + depth
@@ -135,12 +128,6 @@ def emit_ctrl_spine(fanout, depth, dev="npu2"):
         f"      aie.packet_dest<%t0{r}, TileControl : 0>" for r in rows
     )
     tile_decls = "\n".join(f"    %t0{r} = aie.tile(0, {r})" for r in rows)
-    # RUN + CHECK lines, embedded so `aie-opt ... | FileCheck <this file>`
-    # proves the multicast routing substrate exactly as
-    # freeze_design_aware_coherent.mlir does, parameterized by N:
-    #   * the shim switchbox drives exactly ONE is_ctrl_pkt_overlay North master
-    #     (a single coherent trunk, NOT N separate shim masters), and
-    #   * all N destinations land a TileControl masterset off that one trunk.
     checks = f"""// RUN: aie-opt %s --aie-freeze-control-fabric="design-aware=true" --aie-create-pathfinder-flows | FileCheck %s
 //
 // Hand-authored control MULTICAST spine (fanout={fanout}, depth={depth}): one
@@ -185,24 +172,23 @@ def main():
     p.add_argument(
         "--fanout",
         type=int,
-        default=1,
-        help="control-packet multicast fanout: number of destination tiles the "
-        "SAME reconfigure is delivered to (default 1 = single-dest baseline)",
+        default=2,
+        help="control-packet multicast fanout: number of controlled core tiles "
+        "(rows 2..1+N) the SAME reconfigure is delivered to (default 2)",
     )
     p.add_argument(
         "--depth",
         type=int,
         default=1,
-        help="within-column spine depth: stretch the farthest destination to "
-        "row 1+D so the multicast trunk is D tiles deep (>= fanout; default 1 "
-        "leaves the fanout rows unchanged)",
+        help="within-column spine depth for --emit-ctrl-spine only: stretch the "
+        "farthest destination to row 1+D (>= fanout; default 1)",
     )
     p.add_argument(
         "--emit-ctrl-spine",
         action="store_true",
-        help="emit the standalone hand-authored control MULTICAST spine (one "
-        "packet_flow, N TileControl dests) + its RUN/CHECK lines, for the "
-        "offline masterset FileCheck, instead of the buildable design",
+        help="emit the standalone hand-authored control MULTICAST spine + its "
+        "RUN/CHECK lines for the offline masterset FileCheck (make checkspine), "
+        "instead of the buildable device design",
     )
     a = p.parse_args()
 

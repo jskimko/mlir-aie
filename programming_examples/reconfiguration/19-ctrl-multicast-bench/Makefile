@@ -9,61 +9,86 @@ name := ctrl_multicast_bench
 # out of this one rung dir with no collisions.
 BUILDDIR ?= build
 
-# Rung 19: control-packet MULTICAST delivery-latency microbench. ONE resident
-# overlay -- shim(0,0) fans a data ingress + egress leg to FANOUT compute tiles
-# (0,2)..(0,1+FANOUT), each doing the trivial out = in + 11*i add (rung 18's
-# oracle, NO external kernel) -- folded into ONE overlay ELF via aiecc
-# --get-full-elf --reconfig-method=$(METHOD). At FANOUT=1 this is the single-dest
-# baseline. This rung is offline-only (no host test.cpp / device run): `all`
-# builds the overlay ELF + its build/overlay*.prj, and `checkspine` (below)
-# lowers the hand-authored multicast spine and proves it collapses to ONE
-# stream-switch masterset -- the offline gates, not a device dispatch.
+# Rung 19: the DEVICE make-or-break for WITHIN-COLUMN control multicast. ONE
+# resident reconfigure design -- shim(0,0) -> memtile(0,1) -split-> FANOUT cores
+# (0,2)..(0,1+FANOUT) -join-> memtile -> shim, each core out = in + 11*i (rung
+# 18's oracle, NO external kernel) -- folded into ONE overlay ELF via aiecc
+# --get-full-elf --reconfig-method=ctrlpkt. CTRL_BCAST=within-col (default) makes
+# aiecc thread Task 4's --control-broadcast into the column-control-overlay pass,
+# so the column's control DELIVERY leg collapses to ONE multi-dest packet_flow
+# (a within-column vertical multicast spine). `make run` dispatches config 1 once
+# and the host (test.cpp) asserts every core's per-row output sentinel: all
+# correct = multicast delivers; still-poison = transport-incomplete (localized);
+# wrong value = mis-delivery. A refutation is a first-class result.
 #
-# METHOD  loadpdi | write32 | ctrlpkt (default) -- delivery method (see common.mk).
-NUM ?= 1
+# METHOD    loadpdi | write32 | ctrlpkt (default) -- delivery method (see common.mk).
+# CTRL_BCAST off | within-col (default) -- overlay control-broadcast grouping.
+# FANOUT    number of controlled core tiles in column 0 (rows 2..1+FANOUT); npu2
+#           has 4 core rows (2..5), so FANOUT in 1..4. Start the device run at 2.
+NUM     ?= 1
+FANOUT  ?= 2
+DEPTH   ?= 1
+CTRL_BCAST ?= within-col
 
-# gen.py's --fanout/--depth knobs DRIVE the emitted routing (see checkspine /
-# spinesweep below): FANOUT = the number of TileControl destinations the single
-# control multicast fans out to (N compute tiles rows 2..1+N); DEPTH = the
-# within-column spine length (the farthest destination sits at row 1+DEPTH).
-# Recursive (`=`, not `:=`) and set BEFORE the include so common.mk's
-# `GEN_FLAGS ?=` does not clobber it.
-FANOUT ?= 1
-DEPTH  ?= 1
+# gen.py's --fanout DRIVES the design (FANOUT core tiles). --depth only affects
+# the offline --emit-ctrl-spine path (checkspine below). Recursive (`=`) and set
+# BEFORE the include so common.mk's `GEN_FLAGS ?=` does not clobber it.
 GEN_FLAGS = --fanout $(FANOUT) --depth $(DEPTH)
+
+# Force per-config designs to rebuild when FANOUT changes (common.mk's
+# design_c%.mlir pattern rule keys only on gen.py/Makefile mtime; the stamp wires
+# the flag VALUES in). Must be a simple `:=` set before the include.
+DESIGN_STAMP := $(BUILDDIR)/.genflags
 
 include ../common/common.mk
 
-# `make sweep`/`make stats` (common.mk) description string.
-sweep_desc = N (= NUM) $(SWEEP)  ctrl-multicast configs (add-K(i)), fanout=$(FANOUT) $(arm_desc)
+# The stamp file: rewritten only when GEN_FLAGS changes (cmp guard).
+.PHONY: force-genflags
+force-genflags:
+$(BUILDDIR)/.genflags: force-genflags
+	@mkdir -p $(BUILDDIR)
+	@printf '%s\n' '$(GEN_FLAGS)' | cmp -s - $@ 2>/dev/null || \
+	  printf '%s\n' '$(GEN_FLAGS)' > $@
 
-# No PARALLEL/EXPAND/wholectx arms in this rung (Task 1 scope): every METHOD
-# folds through the same union-overlay path.
-overlay_sel := --get-full-elf --reconfig-method=$(METHOD)
-elf_tag     := $(tag)
+# `make sweep`/`make stats` (common.mk) description string.
+sweep_desc = N (= NUM) $(SWEEP)  ctrl-multicast configs, fanout=$(FANOUT) bcast=$(CTRL_BCAST) $(arm_desc)
+
+# Overlay build: fold the NUM single-config designs into one overlay ELF and
+# thread Task 4's control-broadcast flag through aiecc (CTRL_BCAST default
+# within-col => the column control-delivery leg is one multi-dest multicast;
+# CTRL_BCAST=off => the byte-identical per-tile single-dest baseline).
+overlay_sel := --get-full-elf --reconfig-method=$(METHOD) --control-broadcast=$(CTRL_BCAST)
+# Artifact name carries method (arm_tag) + broadcast mode so within-col and off
+# builds never collide in build/.
+bcast_tag   := $(if $(filter within-col,$(CTRL_BCAST)),_bcast)
+elf_tag     := $(tag)$(bcast_tag)
 overlay_elf := overlay_$(NUM)$(elf_tag).elf
 overlay_prj := overlay_$(NUM)$(elf_tag).prj
 
+# test.cpp: ONE input + ONE output buffer, each FANOUT*4 int32. It sentinel-
+# prefills the output, dispatches main:config_1 once (after main:init stands up
+# the resident overlay), and classifies every core row's output slice.
+run_args := $(NUM) --cols $(FANOUT) --tag "$(elf_tag)" \
+	    --warmup $(WARMUP) --iters $(ITERS) --timeout $(TIMEOUT)
+
 CONFIG_DESIGNS := $(foreach A,$(shell seq 1 $(NUM)),$(BUILDDIR)/design_c$(A).mlir)
 
-all: $(BUILDDIR)/$(overlay_elf)
+all: $(BUILDDIR)/$(overlay_elf) $(BUILDDIR)/test.exe
 
 $(BUILDDIR)/$(overlay_elf): $(CONFIG_DESIGNS)
-	@echo "==>  aiecc    $@  (METHOD=$(METHOD) fanout=$(FANOUT))"
+	@echo "==>  aiecc    $@  (METHOD=$(METHOD) fanout=$(FANOUT) bcast=$(CTRL_BCAST))"
 	$(Q)cd $(BUILDDIR) && aiecc $(aiecc_flags) $(overlay_sel) \
 	  --full-elf-name=$(overlay_elf) --dump-intermediates --tmpdir=$(overlay_prj) \
 	  --output-dir=. $(notdir $(CONFIG_DESIGNS))
 
 # ---------------------------------------------------------------------------
-# Offline masterset check for the hand-authored control MULTICAST spine (Step 3
-# of the multicast task). gen.py --emit-ctrl-spine emits the standalone one-
-# packet_flow / N-TileControl-dest vehicle plus its RUN/CHECK lines; we lower it
-# through the SAME control-freeze + pathfinder passes the reconfigure flow uses
+# Offline masterset check for the hand-authored control MULTICAST spine (kept as
+# the independent offline proof). gen.py --emit-ctrl-spine emits the standalone
+# one-packet_flow / N-TileControl-dest vehicle plus its RUN/CHECK lines; we lower
+# it through the SAME control-freeze + pathfinder passes the reconfigure flow uses
 # and prove the N destinations collapse onto ONE is_ctrl_pkt_overlay masterset at
-# the shim (a genuine switchbox multicast, NOT N unicast routes). Uses FileCheck
-# when discoverable (the embedded CHECK lines), and always runs a portable
-# grep-based assertion so the check is self-contained.
-SPINE_PASSES := --aie-freeze-control-fabric="design-aware=true" --aie-create-pathfinder-flows
+# the shim (a genuine switchbox multicast, NOT N unicast routes).
+SPINE_PASSES := --aie-pin-control-overlay="mode=adapt" --aie-create-pathfinder-flows
 FILECHECK    := $(firstword $(wildcard $(dir $(shell command -v aie-opt))FileCheck) \
                             $(shell command -v FileCheck 2>/dev/null) \
                             $(wildcard $(srcdir)/../../../my_install/mlir/bin/FileCheck))
@@ -91,9 +116,8 @@ checkspine:
 	      && echo "     FILECHECK:  PASS"; \
 	  else echo "     FILECHECK:  skipped (FileCheck not found; grep-proof stands)"; fi
 
-# Sweep the fan-out width: build the reconfigure design AND run the masterset
-# check at each point. A build/route FAILURE at some N is a first-class finding
-# (an oversized fan-out exceeds the npu2 column height / shim channels).
+# Sweep the fan-out width offline. A build/route FAILURE at some N is a first-
+# class finding (an oversized fan-out exceeds the npu2 column height).
 SPINE_SWEEP ?= 1 2 4 8
 spinesweep:
 	@for f in $(SPINE_SWEEP); do \

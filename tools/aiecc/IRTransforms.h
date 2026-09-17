@@ -778,7 +778,8 @@ inline std::unique_ptr<mlir::PassManager> getInputWithAddressesPipeline(
     bool dynamicObjFifos, bool packetSwObjFifos, bool ctrlPktOverlay,
     bool bf16Emulation, bool loadPdiToCtrlPkt = false,
     bool skipObjectFifoVerify = false, bool autoPacketizeControlIngress = false,
-    bool dmaFenceSharedMem = false) {
+    bool dmaFenceSharedMem = false,
+    llvm::StringRef controlBroadcast = "off") {
   using namespace xilinx::AIE;
   namespace X = xilinx::AIEX;
   auto pm = std::make_unique<mlir::PassManager>(ctx);
@@ -856,8 +857,8 @@ inline std::unique_ptr<mlir::PassManager> getInputWithAddressesPipeline(
     if (mlir::failed(mlir::parsePassPipeline(
             llvm::formatv(
                 "aie-generate-column-control-overlay{{route-shim-to-tile-ctrl="
-                "true emit-standalone-overlay={0}}",
-                loadPdiToCtrlPkt)
+                "true emit-standalone-overlay={0} control-broadcast={1}}",
+                loadPdiToCtrlPkt, controlBroadcast)
                 .str(),
             *pm)))
       return nullptr;

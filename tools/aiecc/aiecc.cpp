@@ -1067,11 +1067,12 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
                    // --ctrlpkt-auto-packetize bool (negated by
                    // --ctrlpkt-auto-packetize=false).
                    autoPkt = doAutoPacketizeControlIngress,
-                   xtileDma = dmaFenceSharedMem.getValue()](
+                   xtileDma = dmaFenceSharedMem.getValue(),
+                   ctrlBcast = controlBroadcast.getValue()](
                       mlir::MLIRContext *ctx, mlir::ModuleOp mod) {
                     return getInputWithAddressesPipeline(
                         ctx, mod, scheme, dyn, pkt, ctrl, bf16, ldpdi,
-                        skipVerify, autoPkt, xtileDma);
+                        skipVerify, autoPkt, xtileDma, ctrlBcast);
                   }});
 
   // Scratchpad run-time parameters sidecar file
