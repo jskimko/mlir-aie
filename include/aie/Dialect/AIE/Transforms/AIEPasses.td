@@ -604,6 +604,16 @@ def AIEGenerateColumnControlOverlay
            "still reconfigurable (default, correct-by-construction). Ablation "
            "study only: set false to cover just the occupied bounding box, "
            "which reproduces the relay-spill no-route -- may fail to route.">,
+       Option<
+           "clControlBroadcast", "control-broadcast", "std::string",
+           /*default=*/"\"off\"",
+           "Group a column's controlled COMPUTE tiles onto ONE multi-dest "
+           "control packet_flow (a within-column vertical multicast spine) "
+           "instead of one flow per tile. Available options: ['off', "
+           "'within-col']. Default 'off' is byte-identical to per-tile "
+           "emission. 'within-col' folds only the delivery (shim MM2S -> "
+           "TileControl) leg's compute tiles; shim/memtile control and the "
+           "S2MM/TCT completion leg stay per-tile.">,
   ];
 }
 

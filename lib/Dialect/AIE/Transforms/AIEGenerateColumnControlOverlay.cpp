@@ -639,16 +639,45 @@ struct AIEGenerateColumnControlOverlayPass
   }
 
   // Partition the column's control tiles into multicast groups: every tile in
-  // a group shares one control packet flow (one source, looped dests). Default
-  // (this task) is the identity grouping -- one tile per group -- so each
-  // group lowers to a single-dest flow, byte-identical to the per-tile
-  // emission. Task 4 makes the grouping configurable to fold multiple tiles
-  // into one multicast flow.
-  static SmallVector<SmallVector<AIE::TileOp>>
-  groupControlTiles(const SmallVector<AIE::TileOp> &ctrlTiles) {
+  // a group shares one control packet flow (one source, looped dests).
+  //
+  // Default (`control-broadcast=off`) is the identity grouping -- one tile per
+  // group -- so each group lowers to a single-dest flow, byte-identical to the
+  // per-tile emission.
+  //
+  // `control-broadcast=within-col` folds a column's controlled COMPUTE (core)
+  // tiles into ONE group, so the delivery leg emits ONE multi-dest control
+  // packet_flow (a within-column vertical multicast spine, exactly the proven
+  // freeze_design_aware_coherent topology). This is a PURE broadcast: same
+  // reconfigure content to every core, so all N dests accept the group's one
+  // shared flow id. Only applied to the ingress/MM2S delivery leg
+  // (`isShimMM2S`); shim/memtile control stay identity, and the S2MM/TCT
+  // completion leg (isShimMM2S=false) stays per-tile so each row signals its
+  // own done. A single-compute-tile column degrades to identity.
+  SmallVector<SmallVector<AIE::TileOp>>
+  groupControlTiles(const SmallVector<AIE::TileOp> &ctrlTiles, bool isShimMM2S) {
     SmallVector<SmallVector<AIE::TileOp>> groups;
-    for (auto tOp : ctrlTiles)
-      groups.push_back({tOp});
+    if (clControlBroadcast != "within-col" || !isShimMM2S) {
+      for (auto tOp : ctrlTiles)
+        groups.push_back({tOp});
+      return groups;
+    }
+    // within-col: gather the column's core tiles into one multicast group;
+    // every non-core (shim, memtile) control tile stays its own identity group.
+    SmallVector<AIE::TileOp> computeGroup;
+    SmallVector<SmallVector<AIE::TileOp>> identityGroups;
+    for (auto tOp : ctrlTiles) {
+      if (tOp.isCoreTile())
+        computeGroup.push_back(tOp);
+      else
+        identityGroups.push_back({tOp});
+    }
+    // Emit the compute multicast group first so its shared flow id and shim
+    // alloc represent the spine; a lone core degrades to a plain identity group.
+    if (!computeGroup.empty())
+      groups.push_back(computeGroup);
+    for (auto &g : identityGroups)
+      groups.push_back(g);
     return groups;
   }
 
@@ -741,7 +770,7 @@ struct AIEGenerateColumnControlOverlayPass
     // group. The identity grouping makes each group a single tile, so the
     // representative tile below is that one tile and the emission is
     // byte-identical to the former per-tile loop.
-    auto ctrlTileGroups = groupControlTiles(ctrlTiles);
+    auto ctrlTileGroups = groupControlTiles(ctrlTiles, isShimMM2S);
     for (auto &group : ctrlTileGroups) {
       // Representative tile: drives the flow id, shim-channel choice, and the
       // shim allocation. For the identity grouping it is the group's only
