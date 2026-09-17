@@ -9,23 +9,25 @@ name := ctrl_multicast_bench
 # out of this one rung dir with no collisions.
 BUILDDIR ?= build
 
-# Rung 19: control-packet MULTICAST delivery-latency microbench. Task 1 scaffolds
-# the single-dest BASELINE: ONE resident overlay -- shim(0,0) <-(1 MM2S / 1
-# S2MM)-> ONE compute tile(0,2) doing the trivial out = in + 11*i add (rung 18's
+# Rung 19: control-packet MULTICAST delivery-latency microbench. ONE resident
+# overlay -- shim(0,0) fans a data ingress + egress leg to FANOUT compute tiles
+# (0,2)..(0,1+FANOUT), each doing the trivial out = in + 11*i add (rung 18's
 # oracle, NO external kernel) -- folded into ONE overlay ELF via aiecc
-# --get-full-elf --reconfig-method=$(METHOD). This is offline-only for now (no
-# host test.cpp / device run): `all` builds just the overlay ELF + its
-# build/overlay*.prj, so the Task-1 gate is the build plus a grep of the emitted
-# control-packet route, not a device dispatch.
+# --get-full-elf --reconfig-method=$(METHOD). At FANOUT=1 this is the single-dest
+# baseline. This rung is offline-only (no host test.cpp / device run): `all`
+# builds the overlay ELF + its build/overlay*.prj, and `checkspine` (below)
+# lowers the hand-authored multicast spine and proves it collapses to ONE
+# stream-switch masterset -- the offline gates, not a device dispatch.
 #
 # METHOD  loadpdi | write32 | ctrlpkt (default) -- delivery method (see common.mk).
 NUM ?= 1
 
-# gen.py's --fanout/--depth knobs are RESERVED for Task 2 (multicast delivery of
-# the SAME reconfigure to N destination tiles over a D-deep tree); both are
-# threaded through here so the pattern-rule plumbing is already in place, but
-# NEITHER changes the emitted design yet. Recursive (`=`, not `:=`) and set
-# BEFORE the include so common.mk's `GEN_FLAGS ?=` does not clobber it.
+# gen.py's --fanout/--depth knobs DRIVE the emitted routing (see checkspine /
+# spinesweep below): FANOUT = the number of TileControl destinations the single
+# control multicast fans out to (N compute tiles rows 2..1+N); DEPTH = the
+# within-column spine length (the farthest destination sits at row 1+DEPTH).
+# Recursive (`=`, not `:=`) and set BEFORE the include so common.mk's
+# `GEN_FLAGS ?=` does not clobber it.
 FANOUT ?= 1
 DEPTH  ?= 1
 GEN_FLAGS = --fanout $(FANOUT) --depth $(DEPTH)

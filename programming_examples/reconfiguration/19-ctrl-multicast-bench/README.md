@@ -5,29 +5,26 @@ SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # Rung 19 -- control-packet multicast delivery-latency microbench
 
-Task 1 scaffold: the **single-dest baseline** for a microbench that will measure
-control-packet **MULTICAST** delivery latency on npu2 (AIE2P) -- how much faster (or
-slower) it is to deliver ONE reconfigure to N destination tiles via a genuine
-switchbox multicast versus N separate unicast deliveries. This rung is cloned from
-`18-reconfig-scaling` and reduced to the smallest design that still builds through
-the existing `ctrlpkt` flow unchanged.
+A microbench that measures control-packet **MULTICAST** delivery latency on npu2
+(AIE2P) -- how much faster (or slower) it is to deliver ONE reconfigure to N
+destination tiles via a genuine switchbox multicast versus N separate unicast
+deliveries. This rung is cloned from `18-reconfig-scaling` and reduced to the
+smallest design that still builds through the existing `ctrlpkt` flow unchanged.
 
-## What this rung is (Task 1 scope)
+## What this rung is
 
-`gen.py` emits ONE resident overlay: a single data pipeline `shim(0,0) --(1
-MM2S)--> compute tile(0,2) --(1 S2MM)--> shim(0,0)`, with ONE compute tile doing
-the trivial in-core scalar `out = in + 11*i` (rung 18's oracle, NO external
-kernel). At the default `NUM=1` the design is reconfigured through exactly ONE
-config, so `main:config_1`'s control-packet delivery targets exactly ONE
-destination tile -- the plain single-dest control reconfigure that later
-multicast work will diff against.
+`gen.py` emits ONE resident overlay: shim(0,0) fans a data ingress + egress leg
+to `FANOUT` compute tiles `(0,2)..(0,1+FANOUT)`, each doing the trivial in-core
+scalar `out = in + 11*i` (rung 18's oracle, NO external kernel). Every
+destination tile receives the SAME reconfigure content, so ONE control-packet
+MULTICAST (one source, `FANOUT` destinations) is a valid vehicle for delivering
+it. At `FANOUT=1` this reduces to the plain single-dest control reconfigure (the
+baseline the multicast diffs against); the `NUM` axis still cycles that design
+through `NUM` configs (`main:config_1..N`) per dispatch.
 
-`gen.py --fanout N` now emits `N` compute tiles (rows 2..1+N of column 0), each
-receiving the **SAME** reconfigure content, so ONE control-packet MULTICAST (one
-source, `N` destinations) is a valid vehicle for delivering the reconfigure.
-`--depth D` stretches the farthest destination to row `1+D` so the multicast
-trunk is `D` tiles deep (a within-column South-in / North-out spine). At the
-default `N=1` this is exactly the single-dest baseline above.
+`--fanout N` sets the number of TileControl destinations (the `N` compute tiles
+above); `--depth D` stretches the farthest destination to row `1+D` so the
+multicast trunk is `D` tiles deep (a within-column South-in / North-out spine).
 
 This rung is **offline-only**: there is no host `test.cpp` / device run. The two
 offline gates are (1) the `aiecc` build (`make ...` -> overlay ELF + its
