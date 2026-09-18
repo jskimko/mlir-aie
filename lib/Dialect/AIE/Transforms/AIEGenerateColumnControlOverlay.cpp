@@ -701,7 +701,18 @@ struct AIEGenerateColumnControlOverlayPass
   // Column-local uniqueness suffices -- routing disambiguates per physical
   // switchbox, so the spare need not be module-wide unique. Returns -1 if all
   // 5-bit ids are claimed on the leg (fail loud at the call site).
-  int pickSpareCtrlPktId(const SmallVector<AIE::TileOp> &ctrlTiles,
+  //
+  // The avoid-set is BOTH the controlled tiles' controller_ids AND every
+  // aie.packet_flow id already in the device. aie.packet_flow $ID is a single
+  // flat id space shared by control AND data flows; under the shim-channel
+  // sharing path (sharedWithData) a control flow and a data flow can key on the
+  // same physical (tile,port), so a spare that aliases a low data-flow id (e.g.
+  // 1) would silently conflate control and data on the switchbox rule table
+  // (NOT fail-loud). ObjectFifo lowering (which materializes packet-switched
+  // data flows) runs BEFORE this overlay pass, so the walk sees those data
+  // flows.
+  int pickSpareCtrlPktId(DeviceOp device,
+                         const SmallVector<AIE::TileOp> &ctrlTiles,
                          const DenseMap<TileID, int> &tileIDMap) {
     llvm::SmallSet<int, 8> used;
     for (auto ct : ctrlTiles) {
@@ -711,6 +722,7 @@ struct AIEGenerateColumnControlOverlayPass
                it != tileIDMap.end())
         used.insert(it->second);
     }
+    device.walk([&](AIE::PacketFlowOp f) { used.insert(f.IDInt()); });
     for (int id = 1; id < 32; ++id)
       if (!used.count(id))
         return id;
@@ -837,7 +849,7 @@ struct AIEGenerateColumnControlOverlayPass
       // a multicast; identity/residual groups (size 1) keep their native id, so
       // control-broadcast=off (all groups size 1) is byte-identical.
       if (isShimMM2S && group.size() > 1) {
-        int spare = pickSpareCtrlPktId(ctrlTiles, tileIDMap);
+        int spare = pickSpareCtrlPktId(device, ctrlTiles, tileIDMap);
         if (spare < 0) {
           device->emitOpError("within-col control multicast: no spare control-"
                               "packet id available on column ")
