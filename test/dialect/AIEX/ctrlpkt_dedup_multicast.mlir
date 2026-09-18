@@ -49,15 +49,15 @@ aie.device(npu2) {
 
 // -----
 
-// NEGATIVE (safety guard, design sec 5): a supposedly-common position whose data
-// is NOT byte-identical across the group is classified UNIQUE; because its offset
+// NEGATIVE (safety guard, design sec 5): a shared offset (present on all tiles)
+// whose data is NOT byte-identical is classified UNIQUE; because its offset
 // (0x1D000) is NOT a stream-switch routing register, the divergence is unsafe to
-// multicast and the pass fails loud (this is the "non-equivalent common" fault).
+// multicast and the pass fails loud. The diagnostic anchors on the first packet
+// carrying that offset (row2's).
 aie.device(npu2) {
   %t02 = aie.tile(0, 2) {ctrl_pkt_mcast_group = 5 : i32}
   %t03 = aie.tile(0, 3) {ctrl_pkt_mcast_group = 5 : i32}
   aie.runtime_sequence @m() {
-    // The diagnostic attaches to the representative (lowest-row) packet.
     // expected-error@+1 {{is not a stream-switch routing register}}
     aiex.control_packet {address = 2215936 : ui32, data = array<i32: 111>, opcode = 0 : i32, stream_id = 0 : i32}
     aiex.control_packet {address = 3264512 : ui32, data = array<i32: 222>, opcode = 0 : i32, stream_id = 0 : i32}
@@ -66,33 +66,32 @@ aie.device(npu2) {
 
 // -----
 
-// NEGATIVE (alignment guard, design sec 5 / risk 3): the two tiles present
-// DIFFERENT local-offset sequences (0x1D000 vs 0x1D004), so the blocks are not
-// positionally alignable and the pass fails loud.
+// POSITIVE (risk 3 -- row-asymmetric routing, the real 76-vs-84 geometry):
+// alignment is OFFSET-KEYED, not positional, so UNEQUAL packet counts dedup
+// fine. row2 (representative) has an EXTRA pass-through routing packet at
+// 0x3F038 (Stream_Switch_Master_Config_North1) that row3 does not:
+//   row2: 0x1D000 COMMON(100)  0x3F034 UNIQUE(1)  0x3F038 UNIQUE(3, extra)
+//   row3: 0x1D000 COMMON(100)  0x3F034 UNIQUE(2)
+// The shared 0x1D000 collapses to ONE mcast packet; both routing offsets stay
+// per-tile (the extra 0x3F038 kept on row2, no fail-loud); row3's 0x1D000 copy
+// (address 3264512) is deleted.
+
+// CHECK-LABEL: aie.runtime_sequence @asym
+// CHECK-NEXT: aiex.control_packet {address = 2215936 : ui32, data = array<i32: 100>, mcast_pkt_id = 5 : ui32
+// CHECK-NEXT: aiex.control_packet {address = 2355252 : ui32, data = array<i32: 1>, opcode
+// CHECK-NEXT: aiex.control_packet {address = 2355256 : ui32, data = array<i32: 3>, opcode
+// CHECK-NEXT: aiex.control_packet {address = 3403828 : ui32, data = array<i32: 2>, opcode
+// CHECK-NOT: address = 3264512
 aie.device(npu2) {
   %t02 = aie.tile(0, 2) {ctrl_pkt_mcast_group = 5 : i32}
   %t03 = aie.tile(0, 3) {ctrl_pkt_mcast_group = 5 : i32}
-  aie.runtime_sequence @m() {
+  aie.runtime_sequence @asym() {
+    // row2 config run (representative) -- has the extra pass-through routing pkt
     aiex.control_packet {address = 2215936 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
-    // expected-error@+1 {{blocks are not positionally alignable}}
-    aiex.control_packet {address = 3264516 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
-  }
-} {has_ctrl_pkt_overlay = true}
-
-// -----
-
-// NEGATIVE (unequal-count guard, design sec 5): the representative (row2) has
-// TWO config packets but row3 has only ONE, so the blocks have differing packet
-// counts and cannot be aligned. Exercises the count-mismatch branch (distinct
-// from the offset-sequence branch above); the diagnostic anchors on a
-// guaranteed-valid op even when a member's phase bucket is short/empty.
-aie.device(npu2) {
-  %t02 = aie.tile(0, 2) {ctrl_pkt_mcast_group = 5 : i32}
-  %t03 = aie.tile(0, 3) {ctrl_pkt_mcast_group = 5 : i32}
-  aie.runtime_sequence @m() {
-    // expected-error@+1 {{differing control-packet counts}}
-    aiex.control_packet {address = 2215936 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
-    aiex.control_packet {address = 2215952 : ui32, data = array<i32: 200>, opcode = 0 : i32, stream_id = 0 : i32}
+    aiex.control_packet {address = 2355252 : ui32, data = array<i32: 1>, opcode = 0 : i32, stream_id = 0 : i32}
+    aiex.control_packet {address = 2355256 : ui32, data = array<i32: 3>, opcode = 0 : i32, stream_id = 0 : i32}
+    // row3 config run -- one fewer packet
     aiex.control_packet {address = 3264512 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
+    aiex.control_packet {address = 3403828 : ui32, data = array<i32: 2>, opcode = 0 : i32, stream_id = 0 : i32}
   }
 } {has_ctrl_pkt_overlay = true}

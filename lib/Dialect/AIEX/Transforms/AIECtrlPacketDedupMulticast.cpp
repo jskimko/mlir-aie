@@ -28,6 +28,7 @@
 #include "llvm/ADT/StringExtras.h"
 
 #include <map>
+#include <set>
 
 namespace xilinx::AIEX {
 #define GEN_PASS_DEF_AIECTRLPACKETDEDUPMULTICAST
@@ -85,66 +86,80 @@ struct AIECtrlPacketDedupMulticastPass
           AIECtrlPacketDedupMulticastPass> {
 
   // Process one multicast group's packets within one phase (config OR enable).
-  // perTile is ordered [member][position] with member[0] = representative; every
-  // member's list is contiguous + identically ordered (sort-pass precondition).
-  LogicalResult dedupPhase(SmallVectorImpl<SmallVector<NpuControlPacketOp>> &perTile,
+  // perTile is ordered [member][program-order], member[0] = representative
+  // (lowest row => earliest block position after the sort pass). Alignment is
+  // OFFSET-KEYED, NOT positional (design sec 3 + sec 8 risk 3): the lower core's
+  // switchbox passes upper cores' streams through, so it emits EXTRA pass-through
+  // routing packets -> the tiles have UNEQUAL counts (e.g. 76 vs 84). Never
+  // require equal counts; match by local offset instead.
+  LogicalResult dedupPhase(ArrayRef<SmallVector<NpuControlPacketOp>> perTile,
                            uint32_t spareId, const AIE::AIETargetModel &tm,
                            const AIE::RegisterDatabase *db, OpBuilder &b) {
     unsigned n = perTile.size();
     if (n < 2)
       return success();
 
-    // Alignment precondition: equal packet count + identical local-offset
-    // sequence across all N members (design sec 5). Align BY OFFSET (risk 3):
-    // require the offset at each position to match member[0]'s.
-    unsigned len = perTile[0].size();
-    for (unsigned t = 1; t < n; ++t) {
-      if (perTile[t].size() != len) {
-        // Anchor the diagnostic on a guaranteed-valid op: a member with ZERO
-        // packets in this phase (e.g. a tile missing its config run) makes its
-        // vector empty, so .front() on it would be UB. The sizes differ here so
-        // at least one of perTile[0] / perTile[t] is non-empty -- pick that one
-        // (either the representative, or the mismatching member if the
-        // representative is the empty one).
-        NpuControlPacketOp anchor =
-            !perTile[0].empty() ? perTile[0].front() : perTile[t].front();
-        return anchor.emitOpError()
-               << "within-col dedup: group tiles have differing control-packet "
-                  "counts ("
-               << perTile[t].size() << " vs " << len
-               << "); blocks are not positionally alignable";
+    // Per-tile local-offset -> packets, keeping each tile's program order. std
+    // ordered containers give a deterministic offset walk.
+    SmallVector<std::map<uint32_t, SmallVector<NpuControlPacketOp>>> byOff(n);
+    std::set<uint32_t> allOffsets;
+    for (unsigned t = 0; t < n; ++t)
+      for (NpuControlPacketOp cp : perTile[t]) {
+        uint32_t o = localOffset(cp, tm);
+        byOff[t][o].push_back(cp);
+        allOffsets.insert(o);
       }
-      for (unsigned i = 0; i < len; ++i)
-        if (localOffset(perTile[t][i], tm) != localOffset(perTile[0][i], tm))
-          return perTile[t][i].emitOpError()
-                 << "within-col dedup: group tiles have differing local-offset "
-                    "sequences at position "
-                 << i << "; blocks are not positionally alignable";
-    }
 
-    for (unsigned i = 0; i < len; ++i) {
-      NpuControlPacketOp rep = perTile[0][i];
-      bool common = true;
-      for (unsigned t = 1; t < n && common; ++t)
-        common = equivalent(rep, perTile[t][i], tm);
+    for (uint32_t o : allOffsets) {
+      // COMMON iff present on ALL N tiles, exactly once each, and byte-identical
+      // (address-normalized). A duplicated offset (>1 on some tile) is not
+      // collapsible positionally, so treat it as UNIQUE.
+      bool onAllOnce = true;
+      for (unsigned t = 0; t < n && onAllOnce; ++t) {
+        auto it = byOff[t].find(o);
+        onAllOnce = it != byOff[t].end() && it->second.size() == 1;
+      }
+      bool common = onAllOnce;
+      if (common) {
+        NpuControlPacketOp rep = byOff[0][o].front();
+        for (unsigned t = 1; t < n && common; ++t)
+          common = equivalent(rep, byOff[t][o].front(), tm);
+      }
 
       if (common) {
-        // Collapse: keep the representative's packet tagged with the spare
-        // multicast id; drop the other N-1 copies. Keep its native address --
-        // AITargetNPU bakes mcast_pkt_id as the routing id (CORRECTION).
-        rep->setAttr("mcast_pkt_id", b.getUI32IntegerAttr(spareId));
+        // Collapse: keep the representative's packet (earliest program
+        // position) tagged with the spare multicast id; drop the other N-1
+        // copies. Keep its native address -- AITargetNPU bakes mcast_pkt_id as
+        // the routing id (CORRECTION). Deletion-only: each surviving packet
+        // stays in place, so per-tile program order + the phase boundary hold.
+        byOff[0][o].front()->setAttr("mcast_pkt_id",
+                                     b.getUI32IntegerAttr(spareId));
         for (unsigned t = 1; t < n; ++t)
-          perTile[t][i].erase();
+          byOff[t][o].front().erase();
       } else {
-        // UNIQUE: routing residual -- stays per-tile on native id. Safety: the
-        // divergent offset MUST be a stream-switch routing register.
-        uint32_t off = localOffset(rep, tm);
-        if (!isStreamSwitchOffset(off, db))
-          return rep.emitOpError()
-                 << "within-col dedup: divergent control-packet at local offset 0x"
-                 << llvm::utohexstr(off)
+        // UNIQUE: present on some-but-not-all tiles, OR divergent data, OR
+        // duplicated -- the routing residual (incl. the lower core's extra
+        // pass-through rules). Kept per-tile on native id, in place. Safety
+        // (design sec 5): the offset MUST resolve to a stream-switch routing
+        // register; a non-routing per-tile divergence is unsafe to multicast.
+        if (!isStreamSwitchOffset(o, db)) {
+          // Anchor on a guaranteed-valid op: the first packet at this offset on
+          // whichever tile carries it.
+          NpuControlPacketOp anchor;
+          for (unsigned t = 0; t < n; ++t) {
+            auto it = byOff[t].find(o);
+            if (it != byOff[t].end()) {
+              anchor = it->second.front();
+              break;
+            }
+          }
+          return anchor.emitOpError()
+                 << "within-col dedup: divergent/partial control-packet at local "
+                    "offset 0x"
+                 << llvm::utohexstr(o)
                  << " is not a stream-switch routing register; a non-routing "
-                    "divergence across the group is unsafe to multicast";
+                    "per-tile divergence is unsafe to multicast";
+        }
       }
     }
     return success();
