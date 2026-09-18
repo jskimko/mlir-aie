@@ -49,16 +49,20 @@ aie.device(npu2) {
 
 // -----
 
-// NEGATIVE (safety guard, design sec 5): a shared offset (present on all tiles)
-// whose data is NOT byte-identical is classified UNIQUE; because its offset
-// (0x1D000) is NOT a stream-switch routing register, the divergence is unsafe to
-// multicast and the pass fails loud. The diagnostic anchors on the first packet
-// carrying that offset (row2's).
+// POSITIVE (divergent NON-routing residual is fine): a shared offset present on
+// all tiles but with divergent data is UNIQUE and kept per-tile -- regardless of
+// register class. 0x1D000 = DMA_BD0_0, a per-tile OUTPUT BUFFER ADDRESS (each
+// core writes its output to a different location): a legitimate residual, NOT an
+// error. A UNIQUE packet is never multicast; it rides that tile's own native-id
+// residual flow. Both packets are kept, neither carries mcast_pkt_id.
+
+// CHECK-LABEL: aie.runtime_sequence @resid
+// CHECK-NEXT: aiex.control_packet {address = 2215936 : ui32, data = array<i32: 111>, opcode
+// CHECK-NEXT: aiex.control_packet {address = 3264512 : ui32, data = array<i32: 222>, opcode
 aie.device(npu2) {
   %t02 = aie.tile(0, 2) {ctrl_pkt_mcast_group = 5 : i32}
   %t03 = aie.tile(0, 3) {ctrl_pkt_mcast_group = 5 : i32}
-  aie.runtime_sequence @m() {
-    // expected-error@+1 {{is not a stream-switch routing register}}
+  aie.runtime_sequence @resid() {
     aiex.control_packet {address = 2215936 : ui32, data = array<i32: 111>, opcode = 0 : i32, stream_id = 0 : i32}
     aiex.control_packet {address = 3264512 : ui32, data = array<i32: 222>, opcode = 0 : i32, stream_id = 0 : i32}
   }

@@ -66,19 +66,16 @@ static bool equivalent(NpuControlPacketOp a, NpuControlPacketOp b,
   return true;
 }
 
-// Secondary safety (defense in depth): a UNIQUE (divergent) offset must resolve
-// to a stream-switch register class -- the ONLY legitimate per-tile divergence
-// is the pathfinder-resolved output routing. A divergent write outside that
-// class is not a pure-routing residual and is unsafe to multicast.
-static bool isStreamSwitchOffset(uint32_t off, const AIE::RegisterDatabase *db) {
+// Semantic register name for a tile-LOCAL offset (compute tiles: "core" then
+// "memory" module). Empty if the offset is not in the database. Used only for a
+// SOFT diagnostic on UNIQUE writes -- classification does NOT depend on it.
+static StringRef registerName(uint32_t off, const AIE::RegisterDatabase *db) {
   if (!db)
-    return false;
-  // Group members are compute tiles; stream-switch regs live in the "core"
-  // module. Try "memory" too so a mem-side offset is not misjudged.
+    return {};
   for (StringRef mod : {"core", "memory"})
     if (const AIE::RegisterInfo *r = db->lookupRegisterByOffset(off, mod))
-      return StringRef(r->name).starts_with("Stream_Switch");
-  return false;
+      return r->name;
+  return {};
 }
 
 struct AIECtrlPacketDedupMulticastPass
@@ -138,13 +135,20 @@ struct AIECtrlPacketDedupMulticastPass
           byOff[t][o].front().erase();
       } else {
         // UNIQUE: present on some-but-not-all tiles, OR divergent data, OR
-        // duplicated -- the routing residual (incl. the lower core's extra
-        // pass-through rules). Kept per-tile on native id, in place. Safety
-        // (design sec 5): the offset MUST resolve to a stream-switch routing
-        // register; a non-routing per-tile divergence is unsafe to multicast.
-        if (!isStreamSwitchOffset(o, db)) {
-          // Anchor on a guaranteed-valid op: the first packet at this offset on
-          // whichever tile carries it.
+        // duplicated -- e.g. per-tile output routing (stream-switch) or per-tile
+        // output BUFFER ADDRESS (DMA_BD). Kept per-tile in place (native
+        // address, no mcast_pkt_id): a UNIQUE packet is NEVER multicast, it
+        // rides that tile's OWN native-id residual flow to that tile only
+        // (guaranteed available by Task 6 -- every core in a within-col group
+        // gets its own native-id residual flow). So a divergent write of ANY
+        // register class is delivered correctly per-tile; there is no
+        // correctness reason to fail loud. Deletion-only touches only COMMON, so
+        // nothing to do here except an optional soft heads-up.
+        //
+        // SOFT diagnostic (remark, not error -- does not block the build): a
+        // divergent PROGRAM-MEMORY write is unexpected for a same-kernel group
+        // and just means less dedup (still correct).
+        if (registerName(o, db).starts_with("Program")) {
           NpuControlPacketOp anchor;
           for (unsigned t = 0; t < n; ++t) {
             auto it = byOff[t].find(o);
@@ -153,12 +157,12 @@ struct AIECtrlPacketDedupMulticastPass
               break;
             }
           }
-          return anchor.emitOpError()
-                 << "within-col dedup: divergent/partial control-packet at local "
-                    "offset 0x"
-                 << llvm::utohexstr(o)
-                 << " is not a stream-switch routing register; a non-routing "
-                    "per-tile divergence is unsafe to multicast";
+          anchor.emitRemark()
+              << "within-col dedup: divergent program-memory write at local "
+                 "offset 0x"
+              << llvm::utohexstr(o)
+              << " kept per-tile (unexpected for a same-kernel group; reduces "
+                 "dedup but is correct)";
         }
       }
     }
