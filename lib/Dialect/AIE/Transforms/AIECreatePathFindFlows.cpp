@@ -725,20 +725,37 @@ AIEPathfinderPass::runOnPacketFlow(DeviceOp device, OpBuilder &builder,
   // Order the packet flows in order to get determinsitic amsel allocation;
   // allocate amsels for control packet flows before others to ensure
   // consistency in control packet flow overlay.
-  auto getSortedPacketFlows =
-      [&](std::map<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>> pktFlows,
-          std::map<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>
-              ctrlPktFlows) {
-        std::vector<
-            std::pair<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>>
-            sortedpktFlows(pktFlows.begin(), pktFlows.end());
-        std::vector<
-            std::pair<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>>
-            sortedctrlpktFlows(ctrlPktFlows.begin(), ctrlPktFlows.end());
-        sortedctrlpktFlows.insert(sortedctrlpktFlows.end(),
-                                  sortedpktFlows.begin(), sortedpktFlows.end());
-        return sortedctrlpktFlows;
-      };
+  auto getSortedPacketFlows = [&](std::map<std::pair<PhysPort, int>,
+                                           SmallVector<PhysPort, 4>>
+                                      pktFlows,
+                                  std::map<std::pair<PhysPort, int>,
+                                           SmallVector<PhysPort, 4>>
+                                      ctrlPktFlows) {
+    std::vector<std::pair<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>>
+        sortedpktFlows(pktFlows.begin(), pktFlows.end());
+    std::vector<std::pair<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>>
+        sortedctrlpktFlows(ctrlPktFlows.begin(), ctrlPktFlows.end());
+    // Assign amsels to multi-dest (broadcast/multicast) control flows
+    // BEFORE single-dest ones. A multicast must reach ALL its master ports
+    // at a switchbox on ONE shared amsel (a single arbiter+msel drives
+    // every forked master); that is only possible if the multicast claims
+    // those ports before a single-dest flow pins one of them onto a
+    // DIFFERENT arbiter. The amsel loop below is order-dependent and skips
+    // a port already committed to another arbiter (assignPortsToAmsel), so
+    // a multicast processed after its co-located residuals would silently
+    // lose a fork branch (e.g. a within-col control multicast whose spare
+    // id sorts after the per-tile residual ids: the North-trunk
+    // continuation to the upper core is dropped and that core starves).
+    // stable_sort keeps the map's deterministic order among equal-fanout
+    // flows; single-dest builds (all size 1, incl. control-broadcast=off)
+    // are a no-op -> byte-identical.
+    llvm::stable_sort(sortedctrlpktFlows, [](const auto &lhs, const auto &rhs) {
+      return lhs.second.size() > rhs.second.size();
+    });
+    sortedctrlpktFlows.insert(sortedctrlpktFlows.end(), sortedpktFlows.begin(),
+                              sortedpktFlows.end());
+    return sortedctrlpktFlows;
+  };
 
   std::vector<std::pair<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>>
       sortedPacketFlows = getSortedPacketFlows(packetFlows, ctrlPacketFlows);
