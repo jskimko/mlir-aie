@@ -550,35 +550,47 @@ LogicalResult xilinx::AIE::AIETranslateControlPacketsToUI32Vec(
     // stream header with routing pkt_id from target tile's controller_id
     int col = packetOp.getColumnFromAddr();
     int row = packetOp.getRowFromAddr();
-    DeviceOp deviceOp2 = packetOp->getParentOfType<AIE::DeviceOp>();
-    // Read-only tile lookup: this translator runs on a module that (after the
-    // SplitIRAction sharing change) is shared across all control-packet
-    // sequences, so it must NOT create a tile. A missing tile is as fatal as an
-    // unstamped one -- both fall through to the controller_id check below.
-    TileOp destTile = nullptr;
-    for (auto t : deviceOp2.getOps<AIE::TileOp>())
-      if (t.getCol() == col && t.getRow() == row) {
-        destTile = t;
-        break;
-      }
-    auto info =
-        destTile ? destTile->getAttrOfType<AIE::PacketInfoAttr>("controller_id")
-                 : AIE::PacketInfoAttr();
-    // A control packet's stream-header pkt_id is the target tile's
-    // controller_id. If the tile was never stamped (e.g. an overlay-created
-    // pass-through tile that aie-assign-tile-controller-ids did not cover),
-    // baking hdr=0 here silently produces a packet that matches no
-    // stream-switch rule and wedges in-band delivery. Fail loudly at build time
-    // instead.
-    if (!info)
-      return packetOp.emitOpError()
-             << "control packet targets tile (" << col << ", " << row
-             << ") which has no controller_id; every control-route tile must "
-                "be "
-                "stamped before its control-packet header is baked (run "
-                "aie-assign-tile-controller-ids after all control-route tiles "
-                "exist)";
-    uint32_t hdr = (info.getPktType() & 0x7) << 12 | (info.getPktId() & 0xff);
+    uint32_t hdr;
+    if (auto mcastId = packetOp.getMcastPktId()) {
+      // Within-col dedup COMMON packet: ride the shared multicast flow on its
+      // SPARE id. No tile owns the spare id, so the dest-tile controller_id
+      // lookup below would bake the wrong id; bake the explicit mcast id
+      // instead (pkt_type 0, as control controller_ids are stamped). Additive
+      // branch -- absent on every normal packet, so the else path is unchanged.
+      hdr = (0x0 & 0x7) << 12 | (*mcastId & 0xff);
+    } else {
+      DeviceOp deviceOp2 = packetOp->getParentOfType<AIE::DeviceOp>();
+      // Read-only tile lookup: this translator runs on a module that (after the
+      // SplitIRAction sharing change) is shared across all control-packet
+      // sequences, so it must NOT create a tile. A missing tile is as fatal as
+      // an unstamped one -- both fall through to the controller_id check below.
+      TileOp destTile = nullptr;
+      for (auto t : deviceOp2.getOps<AIE::TileOp>())
+        if (t.getCol() == col && t.getRow() == row) {
+          destTile = t;
+          break;
+        }
+      auto info =
+          destTile
+              ? destTile->getAttrOfType<AIE::PacketInfoAttr>("controller_id")
+              : AIE::PacketInfoAttr();
+      // A control packet's stream-header pkt_id is the target tile's
+      // controller_id. If the tile was never stamped (e.g. an overlay-created
+      // pass-through tile that aie-assign-tile-controller-ids did not cover),
+      // baking hdr=0 here silently produces a packet that matches no
+      // stream-switch rule and wedges in-band delivery. Fail loudly at build
+      // time instead.
+      if (!info)
+        return packetOp.emitOpError()
+               << "control packet targets tile (" << col << ", " << row
+               << ") which has no controller_id; every control-route tile must "
+                  "be "
+                  "stamped before its control-packet header is baked (run "
+                  "aie-assign-tile-controller-ids after all control-route "
+                  "tiles "
+                  "exist)";
+      hdr = (info.getPktType() & 0x7) << 12 | (info.getPktId() & 0xff);
+    }
     words[0] = hdr | (0x1 & parity(hdr)) << 31;
 
     // control packet header

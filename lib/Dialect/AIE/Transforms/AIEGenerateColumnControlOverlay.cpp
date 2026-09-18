@@ -691,6 +691,32 @@ struct AIEGenerateColumnControlOverlayPass
     return groups;
   }
 
+  // within-col multicast: pick a SPARE control-packet id for the folded group's
+  // shared flow -- an id in the 5-bit packet-id space NOT used by any controlled
+  // tile on this column leg. Reusing a group member's controller_id (the former
+  // group.front() id) let that member's per-core residual flow be absorbed into
+  // the multicast masterset -> cross-write; a spare keeps every native id (incl.
+  // the representative's) free for its residual. Deterministic: lowest unused
+  // id, skipping 0 (the unstamped-tile misroute sentinel, see AITargetNPU bake).
+  // Column-local uniqueness suffices -- routing disambiguates per physical
+  // switchbox, so the spare need not be module-wide unique. Returns -1 if all
+  // 5-bit ids are claimed on the leg (fail loud at the call site).
+  int pickSpareCtrlPktId(const SmallVector<AIE::TileOp> &ctrlTiles,
+                         const DenseMap<TileID, int> &tileIDMap) {
+    llvm::SmallSet<int, 8> used;
+    for (auto ct : ctrlTiles) {
+      if (auto attr = ct->getAttrOfType<AIE::PacketInfoAttr>("controller_id"))
+        used.insert((int)attr.getPktId());
+      else if (auto it = tileIDMap.find({ct.colIndex(), ct.rowIndex()});
+               it != tileIDMap.end())
+        used.insert(it->second);
+    }
+    for (int id = 1; id < 32; ++id)
+      if (!used.count(id))
+        return id;
+    return -1;
+  }
+
   // Create packet flows per col which moves control packets to and from shim
   // dma
   LogicalResult generatePacketFlowsForControl(
@@ -803,6 +829,24 @@ struct AIEGenerateColumnControlOverlayPass
         }
         ctrlPktFlowID = it->second;
       }
+      // within-col multicast: the folded group's shared flow must NOT reuse a
+      // member's native controller_id (else that member's residual flow is
+      // absorbed into the multicast masterset -> cross-write). Swap in a spare
+      // id; the dedup pass stamps mcast_pkt_id = this spare on COMMON packets so
+      // AITargetNPU bakes it as the routing id. Only the real fold (size > 1) is
+      // a multicast; identity/residual groups (size 1) keep their native id, so
+      // control-broadcast=off (all groups size 1) is byte-identical.
+      if (isShimMM2S && group.size() > 1) {
+        int spare = pickSpareCtrlPktId(ctrlTiles, tileIDMap);
+        if (spare < 0) {
+          device->emitOpError("within-col control multicast: no spare control-"
+                              "packet id available on column ")
+              << col << " (all 5-bit ids are claimed by controlled tiles); "
+              << "cannot route the multicast common leg on a distinct id.";
+          return failure();
+        }
+        ctrlPktFlowID = spare;
+      }
       // Check shim channel availability. A channel already claimed by a data
       // aie.shim_dma_allocation is usable too -- control packets time-share
       // it with the data DMA (disjoint dispatches) instead of double-booking
@@ -838,10 +882,10 @@ struct AIEGenerateColumnControlOverlayPass
             ct->setAttr("ctrl_pkt_shim_chan",
                         builder.getI32IntegerAttr(chosenChan));
         // Hand the within-col multicast group down to the dedup pass: stamp the
-        // shared flow id (this representative's controller_id = ctrlPktFlowID,
-        // pre-increment) on EVERY core in the folded group. The dedup pass reads
-        // it to recover group membership + representative + shared id, then
-        // re-addresses COMMON writes to the representative (multicast id) and
+        // shared flow id (the SPARE id swapped into ctrlPktFlowID above, NOT any
+        // member's controller_id) on EVERY core in the folded group. The dedup
+        // pass reads it to recover group membership + shared id, then tags each
+        // COMMON packet with mcast_pkt_id = this spare (AITargetNPU bakes it) and
         // leaves each tile's routing residual on its native id. Only the folded
         // group (size > 1) is a real multicast; identity/residual groups
         // (size 1) carry no stamp.

@@ -1210,7 +1210,12 @@ def AIE_NpuControlPacketOp: AIEX_Op<"control_packet", []> {
         OptionalAttr<I32Attr>:$length,
         I32Attr:$opcode,
         I32Attr:$stream_id,
-        OptionalAttr<DenseI32ArrayAttr>:$data
+        OptionalAttr<DenseI32ArrayAttr>:$data,
+        // Additive: when present, the routing pkt_id baked into this packet's
+        // stream header is this SPARE multicast id (a within-col dedup common
+        // packet rides the shared multicast flow), not the dest tile's
+        // controller_id. Absent on normal packets (unchanged bake path).
+        OptionalAttr<UI32Attr>:$mcast_pkt_id
   );
   let results = (outs );
   let assemblyFormat = [{ attr-dict }];
@@ -1218,6 +1223,15 @@ def AIE_NpuControlPacketOp: AIEX_Op<"control_packet", []> {
     The control_packet operation represents a low-level AIE control packet header
     and payload.
   }];
+  // Legacy builder (no mcast_pkt_id): keeps existing positional create() callers
+  // source-compatible now that mcast_pkt_id is an added optional attribute.
+  let builders = [
+    OpBuilder<(ins "mlir::IntegerAttr":$address, "mlir::IntegerAttr":$length,
+                   "mlir::IntegerAttr":$opcode, "mlir::IntegerAttr":$stream_id,
+                   "mlir::DenseI32ArrayAttr":$data),
+      [{ build($_builder, $_state, address, length, opcode, stream_id, data,
+               /*mcast_pkt_id=*/nullptr); }]>
+  ];
   let extraClassDeclaration = [{
     uint32_t getRowFromAddr();
     uint32_t getColumnFromAddr();

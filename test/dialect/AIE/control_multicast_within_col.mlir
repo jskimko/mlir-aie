@@ -17,7 +17,9 @@
 
 // Every controlled CORE tile (rows 2-5) is stamped with the shared multicast
 // group id (= the multicast flow id) so the dedup pass can recover group
-// membership + representative + shared id. The stamps appear first in output.
+// membership + shared id. This is a SPARE id (=1): NOT any group member's
+// controller_id (cores are 27,29,30,31), so no core's per-core residual flow is
+// absorbed into the multicast masterset. The stamps appear first in output.
 // OVERLAY: %tile_0_5 = aie.tile(0, 5) {ctrl_pkt_mcast_group = [[FID:[0-9]+]] : i32
 // OVERLAY: %tile_0_4 = aie.tile(0, 4) {ctrl_pkt_mcast_group = [[FID]] : i32
 // OVERLAY: %tile_0_2 = aie.tile(0, 2) {ctrl_pkt_mcast_group = [[FID]] : i32
@@ -43,21 +45,24 @@
 
 // Each core ALSO gets its own native-id single-dest residual flow -- the routing
 // leg the dedup pass fills. So each core appears in BOTH the multicast flow
-// above AND its own unicast flow. The representative core (row 2) residual reuses
-// the shared id; the others carry their distinct native controller ids.
-// OVERLAY: aie.packet_flow([[FID]]) {
+// above (spare id [[FID]]) AND its own unicast flow. CRUCIALLY every residual,
+// INCLUDING the representative core (row 2, native id 27), rides its NATIVE
+// controller_id -- all distinct from the spare multicast id [[FID]] -- so no
+// residual is absorbed into the multicast masterset (the corrected id
+// mechanism). Native core ids are the deterministic validTileIds 27/29/30/31.
+// OVERLAY: aie.packet_flow(27) {
 // OVERLAY-NEXT: aie.packet_source<%shim_noc_tile_0_0, DMA : 0>
 // OVERLAY-NEXT: aie.packet_dest<%tile_0_2, TileControl : 0>
 // OVERLAY-NEXT: } {keep_pkt_header = true, priority_route = true}
-// OVERLAY: aie.packet_flow({{[0-9]+}}) {
+// OVERLAY: aie.packet_flow(29) {
 // OVERLAY-NEXT: aie.packet_source<%shim_noc_tile_0_0, DMA : 0>
 // OVERLAY-NEXT: aie.packet_dest<%tile_0_3, TileControl : 0>
 // OVERLAY-NEXT: } {keep_pkt_header = true, priority_route = true}
-// OVERLAY: aie.packet_flow({{[0-9]+}}) {
+// OVERLAY: aie.packet_flow(30) {
 // OVERLAY-NEXT: aie.packet_source<%shim_noc_tile_0_0, DMA : 0>
 // OVERLAY-NEXT: aie.packet_dest<%tile_0_4, TileControl : 0>
 // OVERLAY-NEXT: } {keep_pkt_header = true, priority_route = true}
-// OVERLAY: aie.packet_flow({{[0-9]+}}) {
+// OVERLAY: aie.packet_flow(31) {
 // OVERLAY-NEXT: aie.packet_source<%shim_noc_tile_0_0, DMA : 0>
 // OVERLAY-NEXT: aie.packet_dest<%tile_0_5, TileControl : 0>
 // OVERLAY-NEXT: } {keep_pkt_header = true, priority_route = true}
