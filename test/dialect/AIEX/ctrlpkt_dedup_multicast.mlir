@@ -78,3 +78,21 @@ aie.device(npu2) {
     aiex.control_packet {address = 3264516 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
   }
 } {has_ctrl_pkt_overlay = true}
+
+// -----
+
+// NEGATIVE (unequal-count guard, design sec 5): the representative (row2) has
+// TWO config packets but row3 has only ONE, so the blocks have differing packet
+// counts and cannot be aligned. Exercises the count-mismatch branch (distinct
+// from the offset-sequence branch above); the diagnostic anchors on a
+// guaranteed-valid op even when a member's phase bucket is short/empty.
+aie.device(npu2) {
+  %t02 = aie.tile(0, 2) {ctrl_pkt_mcast_group = 5 : i32}
+  %t03 = aie.tile(0, 3) {ctrl_pkt_mcast_group = 5 : i32}
+  aie.runtime_sequence @m() {
+    // expected-error@+1 {{differing control-packet counts}}
+    aiex.control_packet {address = 2215936 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
+    aiex.control_packet {address = 2215952 : ui32, data = array<i32: 200>, opcode = 0 : i32, stream_id = 0 : i32}
+    aiex.control_packet {address = 3264512 : ui32, data = array<i32: 100>, opcode = 0 : i32, stream_id = 0 : i32}
+  }
+} {has_ctrl_pkt_overlay = true}

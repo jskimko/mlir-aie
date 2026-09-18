@@ -99,12 +99,21 @@ struct AIECtrlPacketDedupMulticastPass
     // require the offset at each position to match member[0]'s.
     unsigned len = perTile[0].size();
     for (unsigned t = 1; t < n; ++t) {
-      if (perTile[t].size() != len)
-        return perTile[t].front().emitOpError()
+      if (perTile[t].size() != len) {
+        // Anchor the diagnostic on a guaranteed-valid op: a member with ZERO
+        // packets in this phase (e.g. a tile missing its config run) makes its
+        // vector empty, so .front() on it would be UB. The sizes differ here so
+        // at least one of perTile[0] / perTile[t] is non-empty -- pick that one
+        // (either the representative, or the mismatching member if the
+        // representative is the empty one).
+        NpuControlPacketOp anchor =
+            !perTile[0].empty() ? perTile[0].front() : perTile[t].front();
+        return anchor.emitOpError()
                << "within-col dedup: group tiles have differing control-packet "
                   "counts ("
                << perTile[t].size() << " vs " << len
                << "); blocks are not positionally alignable";
+      }
       for (unsigned i = 0; i < len; ++i)
         if (localOffset(perTile[t][i], tm) != localOffset(perTile[0][i], tm))
           return perTile[t][i].emitOpError()
@@ -144,11 +153,6 @@ struct AIECtrlPacketDedupMulticastPass
   void runOnOperation() override {
     AIE::DeviceOp device = getOperation();
     const AIE::AIETargetModel &tm = device.getTargetModel();
-    // getRegisterDatabase() on the target model is protected; the public static
-    // loader gives the same AIE2 database (npu2). Loaded once per pass run.
-    std::unique_ptr<AIE::RegisterDatabase> dbOwner =
-        AIE::RegisterDatabase::loadAIE2();
-    const AIE::RegisterDatabase *db = dbOwner.get();
     OpBuilder b(device.getContext());
 
     // Recover groups from the overlay's tile stamps: (col, spareId) -> rows.
@@ -160,6 +164,14 @@ struct AIECtrlPacketDedupMulticastPass
         groups[{tile.getCol(), (uint32_t)a.getInt()}].push_back(tile.getRow());
     if (groups.empty())
       return;
+
+    // Load the register database only once we know there is a group to process,
+    // so a non-broadcast build (no stamps -> inert pass, Task 9 wires this into
+    // every build) pays no JSON parse. getRegisterDatabase() on the target model
+    // is protected; the public static loader gives the same AIE2 db (npu2).
+    std::unique_ptr<AIE::RegisterDatabase> dbOwner =
+        AIE::RegisterDatabase::loadAIE2();
+    const AIE::RegisterDatabase *db = dbOwner.get();
 
     for (auto seq : device.getOps<AIE::RuntimeSequenceOp>()) {
       if (seq.getBody().empty())
