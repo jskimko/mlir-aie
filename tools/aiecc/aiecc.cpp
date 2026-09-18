@@ -1405,11 +1405,13 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
                     "npu_expanded.mlir",
                     PassPipeline{&context,
                                  [ctrlPkt, resetFree, selfClear, withReset,
-                                  parallelColumnsFlag](mlir::MLIRContext *ctx,
-                                                       mlir::ModuleOp) {
+                                  parallelColumnsFlag,
+                                  ctrlBcast = controlBroadcast.getValue()](
+                                     mlir::MLIRContext *ctx, mlir::ModuleOp) {
                                    return getExpandLoadPdiPipeline(
                                        ctx, ctrlPkt, resetFree, selfClear,
-                                       withReset, parallelColumnsFlag);
+                                       withReset, parallelColumnsFlag,
+                                       ctrlBcast);
                                  }}))
           : npuMaterialized;
 

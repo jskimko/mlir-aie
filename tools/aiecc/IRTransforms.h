@@ -778,8 +778,7 @@ inline std::unique_ptr<mlir::PassManager> getInputWithAddressesPipeline(
     bool dynamicObjFifos, bool packetSwObjFifos, bool ctrlPktOverlay,
     bool bf16Emulation, bool loadPdiToCtrlPkt = false,
     bool skipObjectFifoVerify = false, bool autoPacketizeControlIngress = false,
-    bool dmaFenceSharedMem = false,
-    llvm::StringRef controlBroadcast = "off") {
+    bool dmaFenceSharedMem = false, llvm::StringRef controlBroadcast = "off") {
   using namespace xilinx::AIE;
   namespace X = xilinx::AIEX;
   auto pm = std::make_unique<mlir::PassManager>(ctx);
@@ -1163,10 +1162,21 @@ getNpuDmaLoweringPipeline(mlir::MLIRContext *ctx) {
 // see the reordered packets. It groups each tile's packets contiguously so the
 // per-tile DMAs pack into fewer, longer linear transfers. A no-op outside
 // `ctrlPkt`.
+//
+// `controlBroadcast` (default "off") mirrors the overlay threading
+// (getInputWithAddressesPipeline): under `within-col` it appends the
+// AIECtrlPacketDedupMulticast pass IMMEDIATELY AFTER the tile-sort pass, at
+// this shared producer, so the deduped control-packet stream (common block once
+// on the multicast id + per-tile routing residual on native ids) is what BOTH
+// the ctrlpkt payload translation AND the DMA-offset builder see. Only
+// meaningful under `ctrlPkt && parallelColumns`; the pass is additionally inert
+// unless the overlay stamped `ctrl_pkt_mcast_group`, so `off` is
+// byte-identical.
 inline std::unique_ptr<mlir::PassManager>
 getExpandLoadPdiPipeline(mlir::MLIRContext *ctx, bool ctrlPkt = false,
                          bool resetFree = false, bool selfClear = false,
-                         bool withReset = false, bool parallelColumns = false) {
+                         bool withReset = false, bool parallelColumns = false,
+                         llvm::StringRef controlBroadcast = "off") {
   auto pm = std::make_unique<mlir::PassManager>(ctx);
   std::string expandPipeline = std::string("aie-expand-load-pdi{ctrl-pkt=") +
                                (ctrlPkt ? "true" : "false") +
@@ -1181,9 +1191,20 @@ getExpandLoadPdiPipeline(mlir::MLIRContext *ctx, bool ctrlPkt = false,
   if (ctrlPkt && !resetFree)
     pm->nest<xilinx::AIE::DeviceOp>().addPass(
         xilinx::AIEX::createAIELegalizeControlPacketPass());
-  if (ctrlPkt && parallelColumns)
+  if (ctrlPkt && parallelColumns) {
     pm->nest<xilinx::AIE::DeviceOp>().addPass(
         xilinx::AIEX::createAIESortControlPacketsByTilePass());
+    // Collapse each within-col multicast group's N identical common config
+    // blocks into ONE packet on the multicast id, keeping per-tile routing
+    // residual on native ids. Immediately after the sort pass (its contiguous,
+    // identically-ordered per-tile blocks are the alignment precondition) and
+    // before the module splits into the payload/DMA consumers. No-op unless
+    // the overlay ran with control-broadcast=within-col (guarded here so the
+    // default is byte-identical, and inert anyway without the mcast stamps).
+    if (controlBroadcast == "within-col")
+      pm->nest<xilinx::AIE::DeviceOp>().addPass(
+          xilinx::AIEX::createAIECtrlPacketDedupMulticastPass());
+  }
   return pm;
 }
 
