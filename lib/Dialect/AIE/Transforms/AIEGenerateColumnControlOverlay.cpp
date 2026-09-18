@@ -151,6 +151,24 @@ struct AIEGenerateColumnControlOverlayPass
   // would target different channels and wedge. Rebuilt each runOnOperation().
   std::set<std::pair<int, int>> moduleCircuitOccupiedByColChan;
 
+  // (col, row) of every tile that carries an aie.core PROGRAM on some
+  // PARTICIPATING config device -- the REAL reconfiguration-with-content cores.
+  // The overlay is a UNION that also pads a column with whole-array COVERAGE
+  // tile clones (cloneMissingTiles) which have NO core: those are not
+  // reconfigured by a given config and must NOT be folded into the within-col
+  // multicast group (else the group's dest set over-delivers config content to
+  // idle coverage cores AND the downstream dedup finds nothing common on the
+  // shared id -- a coverage member contributes zero packets, so the "present on
+  // ALL members" offset key fails and dedup no-ops). The within-col multicast
+  // group for a column is therefore {that column's control tiles} INTERSECT
+  // this set; a core-row tile absent from it stays a single-dest identity
+  // route. Built module-wide (union across participating devices, whose own
+  // cores are still present at this pass stage -- cloneMissingTiles clones only
+  // TileOps, never their cores) so every device (incl. the standalone
+  // @ctrl_pkt_overlay skeleton, which holds only clones) folds the SAME set of
+  // real cores. Rebuilt each runOnOperation().
+  std::set<std::pair<int, int>> moduleCoreTiles;
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OpBuilder builder(module.getContext());
@@ -221,6 +239,19 @@ struct AIEGenerateColumnControlOverlayPass
         }
       }
     }
+
+    // Module-wide set of (col, row) tiles that carry an aie.core PROGRAM on
+    // some participating config device -- the real reconfiguration cores,
+    // distinct from whole-array coverage tile clones (which have no core). The
+    // within-col multicast fold intersects a column's control tiles with this
+    // set so the broadcast net covers only the tiles actually reconfigured (see
+    // the member's comment). Built here, before any device is touched;
+    // cloneMissing- Tiles never adds a core, so the union stays the real cores.
+    moduleCoreTiles.clear();
+    for (auto dev : participating)
+      for (auto coreOp : dev.getOps<AIE::CoreOp>())
+        moduleCoreTiles.insert(
+            {coreOp.getTileOp().colIndex(), coreOp.getTileOp().rowIndex()});
 
     // A standalone `@ctrl_pkt_overlay` device references a single overlay
     // shape, so every participating device must expose the same set of tiles
@@ -485,15 +516,13 @@ struct AIEGenerateColumnControlOverlayPass
   // source, loop of dests). A single-element `dests` reproduces the prior
   // single-dest emission byte for byte; grouping multiple dests is the
   // multicast case (Task 4).
-  AIE::PacketFlowOp createPacketFlowOp(OpBuilder &builder, Location loc,
-                                       int &flowID, Value source,
-                                       xilinx::AIE::WireBundle sourceBundle,
-                                       uint32_t sourceChannel,
-                                       ArrayRef<Value> dests,
-                                       xilinx::AIE::WireBundle destBundle,
-                                       uint32_t destChannel,
-                                       mlir::BoolAttr keep_pkt_header = nullptr,
-                                       mlir::BoolAttr ctrl_pkt_flow = nullptr) {
+  AIE::PacketFlowOp
+  createPacketFlowOp(OpBuilder &builder, Location loc, int &flowID,
+                     Value source, xilinx::AIE::WireBundle sourceBundle,
+                     uint32_t sourceChannel, ArrayRef<Value> dests,
+                     xilinx::AIE::WireBundle destBundle, uint32_t destChannel,
+                     mlir::BoolAttr keep_pkt_header = nullptr,
+                     mlir::BoolAttr ctrl_pkt_flow = nullptr) {
     OpBuilder::InsertionGuard guard(builder);
 
     AIE::PacketFlowOp pktFlow = AIE::PacketFlowOp::create(
@@ -645,35 +674,50 @@ struct AIEGenerateColumnControlOverlayPass
   // group -- so each group lowers to a single-dest flow, byte-identical to the
   // per-tile emission.
   //
-  // `control-broadcast=within-col` folds a column's controlled COMPUTE (core)
-  // tiles into ONE group, so the delivery leg emits ONE multi-dest control
+  // `control-broadcast=within-col` folds a column's REAL reconfiguration cores
+  // (core-row tiles that carry an aie.core program on some participating config
+  // device -- NOT whole-array coverage tile clones, which have no core) into
+  // ONE group, so the delivery leg emits ONE multi-dest control
   // packet_flow (a within-column vertical multicast spine, exactly the proven
-  // freeze_design_aware_coherent topology). This is a PURE broadcast: same
+  // pinned_adapt_coherent topology). This is a PURE broadcast: same
   // reconfigure content to every core, so all N dests accept the group's one
   // shared flow id. Only applied to the ingress/MM2S delivery leg
   // (`isShimMM2S`); shim/memtile control stay identity, and the S2MM/TCT
   // completion leg (isShimMM2S=false) stays per-tile so each row signals its
   // own done. A single-compute-tile column degrades to identity.
   SmallVector<SmallVector<AIE::TileOp>>
-  groupControlTiles(const SmallVector<AIE::TileOp> &ctrlTiles, bool isShimMM2S) {
+  groupControlTiles(const SmallVector<AIE::TileOp> &ctrlTiles,
+                    bool isShimMM2S) {
     SmallVector<SmallVector<AIE::TileOp>> groups;
     if (clControlBroadcast != "within-col" || !isShimMM2S) {
       for (auto tOp : ctrlTiles)
         groups.push_back({tOp});
       return groups;
     }
-    // within-col: gather the column's core tiles into one multicast group;
-    // every non-core (shim, memtile) control tile stays its own identity group.
+    // within-col: gather the column's REAL reconfiguration cores into one
+    // multicast group; every other control tile stays its own identity group.
+    // A tile joins the fold only if it is a core-row tile AND carries an
+    // aie.core program on some participating config device (moduleCoreTiles).
+    // Whole-array COVERAGE tile clones (cloneMissingTiles) sit on a core row
+    // but have no core -- they are not reconfigured by any config, so folding
+    // them would over-deliver config content to idle cores and make the
+    // downstream dedup no-op (a coverage member contributes zero packets, so
+    // nothing is common on the shared id). Excluded from the fold, a coverage
+    // core-row tile keeps its single-dest IDENTITY control route.
     SmallVector<AIE::TileOp> computeGroup;
     SmallVector<SmallVector<AIE::TileOp>> identityGroups;
     for (auto tOp : ctrlTiles) {
-      if (tOp.isCoreTile())
+      bool realReconfigCore =
+          tOp.isCoreTile() &&
+          moduleCoreTiles.count({tOp.colIndex(), tOp.rowIndex()}) > 0;
+      if (realReconfigCore)
         computeGroup.push_back(tOp);
       else
         identityGroups.push_back({tOp});
     }
     // Emit the compute multicast group first so its shared flow id and shim
-    // alloc represent the spine; a lone core degrades to a plain identity group.
+    // alloc represent the spine; a lone core degrades to a plain identity
+    // group.
     if (!computeGroup.empty())
       groups.push_back(computeGroup);
     // When >1 core folded into the multicast group, ALSO emit each core as its
@@ -692,15 +736,16 @@ struct AIEGenerateColumnControlOverlayPass
   }
 
   // within-col multicast: pick a SPARE control-packet id for the folded group's
-  // shared flow -- an id in the 5-bit packet-id space NOT used by any controlled
-  // tile on this column leg. Reusing a group member's controller_id (the former
-  // group.front() id) let that member's per-core residual flow be absorbed into
-  // the multicast masterset -> cross-write; a spare keeps every native id (incl.
-  // the representative's) free for its residual. Deterministic: lowest unused
-  // id, skipping 0 (the unstamped-tile misroute sentinel, see AITargetNPU bake).
-  // Column-local uniqueness suffices -- routing disambiguates per physical
-  // switchbox, so the spare need not be module-wide unique. Returns -1 if all
-  // 5-bit ids are claimed on the leg (fail loud at the call site).
+  // shared flow -- an id in the 5-bit packet-id space NOT used by any
+  // controlled tile on this column leg. Reusing a group member's controller_id
+  // (the former group.front() id) let that member's per-core residual flow be
+  // absorbed into the multicast masterset -> cross-write; a spare keeps every
+  // native id (incl. the representative's) free for its residual.
+  // Deterministic: lowest unused id, skipping 0 (the unstamped-tile misroute
+  // sentinel, see AITargetNPU bake). Column-local uniqueness suffices --
+  // routing disambiguates per physical switchbox, so the spare need not be
+  // module-wide unique. Returns -1 if all 5-bit ids are claimed on the leg
+  // (fail loud at the call site).
   //
   // The avoid-set is BOTH the controlled tiles' controller_ids AND every
   // aie.packet_flow id already in the device. aie.packet_flow $ID is a single
@@ -844,10 +889,10 @@ struct AIEGenerateColumnControlOverlayPass
       // within-col multicast: the folded group's shared flow must NOT reuse a
       // member's native controller_id (else that member's residual flow is
       // absorbed into the multicast masterset -> cross-write). Swap in a spare
-      // id; the dedup pass stamps mcast_pkt_id = this spare on COMMON packets so
-      // AITargetNPU bakes it as the routing id. Only the real fold (size > 1) is
-      // a multicast; identity/residual groups (size 1) keep their native id, so
-      // control-broadcast=off (all groups size 1) is byte-identical.
+      // id; the dedup pass stamps mcast_pkt_id = this spare on COMMON packets
+      // so AITargetNPU bakes it as the routing id. Only the real fold (size >
+      // 1) is a multicast; identity/residual groups (size 1) keep their native
+      // id, so control-broadcast=off (all groups size 1) is byte-identical.
       if (isShimMM2S && group.size() > 1) {
         int spare = pickSpareCtrlPktId(device, ctrlTiles, tileIDMap);
         if (spare < 0) {
@@ -873,34 +918,23 @@ struct AIEGenerateColumnControlOverlayPass
         // The whole column rides the single trunk channel resolved above and
         // published on the shim tile; there is no per-controlled-tile stamp.
         chosenChan = trunkChan;
-        // Only when this row's control is relocated off its fixed mandated
-        // channel onto the column trunk, record the chosen channel on the
-        // controlled tile so AIECtrlPacketToDma delivers on the same channel
-        // the overlay routed. When not relocated, AIECtrlPacketToDma's
-        // fallback recomputes the same mandated channel, so no attribute is
-        // needed -- keeping unrelocated IR (and existing tests) unperturbed.
-        //
-        // Stamp EVERY tile in the group, not just the representative: a
-        // within-col multicast group's single flow delivers to ALL its dest
-        // tiles on this one trunk channel, so AIECtrlPacketToDma must resolve
-        // each dest's (col,row) to the trunk channel too. Stamping only
-        // group.front() left the other dests to fall back to their own
-        // per-row mandated channel, so the column's control resolved to
-        // multiple shim channels and the per-column bd_chain failed loud. For
-        // the identity grouping (control-broadcast=off) each group is a single
-        // tile, so this loop is byte-identical to the former single stamp.
-        for (auto ct : group)
-          if (chosenChan != rowToShimChanMap[ct.rowIndex()])
-            ct->setAttr("ctrl_pkt_shim_chan",
-                        builder.getI32IntegerAttr(chosenChan));
+        // The whole column's control rides this one trunk channel, published
+        // per-column on the shim tile above (the shimTile ctrl_pkt_shim_chan
+        // stamp) and read back per-column by AIECtrlPacketToDma (ctrlChanByCol,
+        // keyed by column). Every controlled tile in the column -- including
+        // every within-col multicast dest -- resolves to that single channel,
+        // so no per-controlled-tile ctrl_pkt_shim_chan stamp is needed. (An
+        // earlier revision stamped each group member here to defeat a per-row
+        // consumer fallback; that fallback was replaced by the per-column
+        // resolve, making the per-tile stamp redundant IR.)
         // Hand the within-col multicast group down to the dedup pass: stamp the
-        // shared flow id (the SPARE id swapped into ctrlPktFlowID above, NOT any
-        // member's controller_id) on EVERY core in the folded group. The dedup
-        // pass reads it to recover group membership + shared id, then tags each
-        // COMMON packet with mcast_pkt_id = this spare (AITargetNPU bakes it) and
-        // leaves each tile's routing residual on its native id. Only the folded
-        // group (size > 1) is a real multicast; identity/residual groups
-        // (size 1) carry no stamp.
+        // shared flow id (the SPARE id swapped into ctrlPktFlowID above, NOT
+        // any member's controller_id) on EVERY core in the folded group. The
+        // dedup pass reads it to recover group membership + shared id, then
+        // tags each COMMON packet with mcast_pkt_id = this spare (AITargetNPU
+        // bakes it) and leaves each tile's routing residual on its native id.
+        // Only the folded group (size > 1) is a real multicast;
+        // identity/residual groups (size 1) carry no stamp.
         if (group.size() > 1)
           for (auto ct : group)
             ct->setAttr("ctrl_pkt_mcast_group",
