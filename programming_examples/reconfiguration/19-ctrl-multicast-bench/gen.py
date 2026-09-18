@@ -50,6 +50,7 @@ def ctrl_multicast_bench(
     add_k: CompileTime[int] = 11,
     cfg: CompileTime[int] = 1,
     fanout: CompileTime[int] = 2,
+    const: CompileTime[int] = 0,
 ):
     dt = np.int32
     coltot = fanout * chunk
@@ -57,52 +58,85 @@ def ctrl_multicast_bench(
     chunk_ty = np.ndarray[(chunk,), np.dtype[dt]]
     offs = [chunk * r for r in range(fanout)]
 
-    # ONE shim ingress objectFifo into the column, SPLIT by the memtile into one
-    # per-core chunk stream; ONE shim egress objectFifo, JOINED from the cores.
-    # This is a single shim MM2S + single shim S2MM on column 0 (rung 18's
-    # single-input geometry), so the resident control overlay gets a free/clean
-    # shim channel and the ctrlpkt per-column bd_chain resolves to one channel.
-    of_a = ObjectFifo(col_ty, name=f"a{cfg}")
+    # ONE shim egress objectFifo, JOINED from the FANOUT cores; and (unless
+    # --const) ONE shim ingress objectFifo SPLIT into one per-core chunk stream.
+    # A single shim MM2S + single shim S2MM on column 0 (rung 18's single-input
+    # geometry) leaves the resident control overlay a clean shim channel and lets
+    # the ctrlpkt per-column bd_chain resolve to one channel.
+    #
+    # --const is the BYTE-IDENTICAL-PAYLOAD probe (corrected make-or-break): each
+    # core writes a CONSTANT sentinel (add_k) with NO per-tile INPUT, so the
+    # kernel + input DMA cannot introduce per-tile content. It does NOT remove
+    # the per-tile OUTPUT stream routing -- each core still joins a DISTINCT
+    # memtile stream down the shared column -- which is why config_1 is STILL not
+    # byte-identical (the per-core switchbox masterset/packet_rules channels
+    # differ); see the lab note's "dedup mandatory" finding.
     of_o = ObjectFifo(col_ty, name=f"o{cfg}")
-    a_sub = of_a.cons().split(
-        offs,
-        obj_types=[chunk_ty] * fanout,
-        names=[f"a{cfg}_{r}" for r in range(fanout)],
-    )
     o_sub = of_o.prod().join(
         offs,
         obj_types=[chunk_ty] * fanout,
         names=[f"o{cfg}_{r}" for r in range(fanout)],
     )
+    of_a = None
+    a_sub = None
+    if not const:
+        of_a = ObjectFifo(col_ty, name=f"a{cfg}")
+        a_sub = of_a.cons().split(
+            offs,
+            obj_types=[chunk_ty] * fanout,
+            names=[f"a{cfg}_{r}" for r in range(fanout)],
+        )
 
     workers = []
     for r in range(fanout):
+        if const:
 
-        def body(fa, fo):
-            ea = fa.acquire(1)
-            eo = fo.acquire(1)
-            for i in range_(chunk):
-                eo[i] = ea[i] + add_k
-            fa.release(1)
-            fo.release(1)
+            def body(fo):
+                eo = fo.acquire(1)
+                for i in range_(chunk):
+                    eo[i] = add_k
+                fo.release(1)
 
-        workers.append(
-            Worker(
-                body,
-                fn_args=[a_sub[r].cons(), o_sub[r].prod()],
-                tile=Tile(0, FIRST_CORE_ROW + r),
+            workers.append(
+                Worker(
+                    body, fn_args=[o_sub[r].prod()], tile=Tile(0, FIRST_CORE_ROW + r)
+                )
             )
-        )
+        else:
 
-    # Runtime sequence: ONE input buffer (coltot int32) filled to the shim
-    # ingress, ONE output buffer drained from the shim egress. Core r reads its
-    # own row slice [r*chunk:(r+1)*chunk] and writes the matching output slice,
-    # so a per-row sentinel in the host output localizes which core delivered.
-    def seq(a_in, o_out, a_prod, o_cons):
-        a_prod.fill(a_in)
-        o_cons.drain(o_out, wait=True)
+            def body(fa, fo):
+                ea = fa.acquire(1)
+                eo = fo.acquire(1)
+                for i in range_(chunk):
+                    eo[i] = ea[i] + add_k
+                fa.release(1)
+                fo.release(1)
 
-    rt = Runtime(seq, [col_ty, col_ty, of_a.prod(), of_o.cons()])
+            workers.append(
+                Worker(
+                    body,
+                    fn_args=[a_sub[r].cons(), o_sub[r].prod()],
+                    tile=Tile(0, FIRST_CORE_ROW + r),
+                )
+            )
+
+    # Runtime sequence: ONE output buffer (coltot int32) drained from the shim
+    # egress; and (unless --const) ONE input buffer filled to the shim ingress.
+    # Core r writes output slice [r*chunk:(r+1)*chunk], so a per-row sentinel in
+    # the host output localizes which core delivered.
+    if const:
+
+        def seq(o_out, o_cons):
+            o_cons.drain(o_out, wait=True)
+
+        rt = Runtime(seq, [col_ty, of_o.cons()])
+    else:
+
+        def seq(a_in, o_out, a_prod, o_cons):
+            a_prod.fill(a_in)
+            o_cons.drain(o_out, wait=True)
+
+        rt = Runtime(seq, [col_ty, col_ty, of_a.prod(), of_o.cons()])
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
@@ -124,11 +158,9 @@ def dest_rows(fanout, depth):
 def emit_ctrl_spine(fanout, depth, dev="npu2"):
     rows = dest_rows(fanout, depth)
     src_chan = 1  # shim MM2S channel reserved for the resident control overlay
-    dests = "\n".join(
-        f"      aie.packet_dest<%t0{r}, TileControl : 0>" for r in rows
-    )
+    dests = "\n".join(f"      aie.packet_dest<%t0{r}, TileControl : 0>" for r in rows)
     tile_decls = "\n".join(f"    %t0{r} = aie.tile(0, {r})" for r in rows)
-    checks = f"""// RUN: aie-opt %s --aie-freeze-control-fabric="design-aware=true" --aie-create-pathfinder-flows | FileCheck %s
+    checks = f"""// RUN: aie-opt %s --aie-pin-control-overlay="mode=adapt" --aie-create-pathfinder-flows | FileCheck %s
 //
 // Hand-authored control MULTICAST spine (fanout={fanout}, depth={depth}): one
 // shim source fans out to {len(rows)} TileControl destinations up column 0.
@@ -161,9 +193,7 @@ module {{
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="rung 19 ctrl-multicast microbench emitter"
-    )
+    p = argparse.ArgumentParser(description="rung 19 ctrl-multicast microbench emitter")
     p.add_argument("--i", type=int, default=1, help="config index (add_k = 11*i)")
     # --n accepted for common.mk pattern-rule compatibility; unused (the
     # destination tile's chunk is fixed at CHUNK).
@@ -184,6 +214,15 @@ def main():
         "farthest destination to row 1+D (>= fanout; default 1)",
     )
     p.add_argument(
+        "--const",
+        type=int,
+        default=0,
+        help="byte-identical-payload probe (corrected make-or-break): each core "
+        "writes a CONSTANT sentinel with NO per-tile input (removes the kernel/"
+        "input-DMA per-tile content; the per-tile OUTPUT stream routing remains, "
+        "so config_1 is still not byte-identical -- see the lab dedup finding)",
+    )
+    p.add_argument(
         "--emit-ctrl-spine",
         action="store_true",
         help="emit the standalone hand-authored control MULTICAST spine + its "
@@ -197,12 +236,12 @@ def main():
         return
 
     mlir = ctrl_multicast_bench.as_mlir(
-        None,
-        None,
+        *([None] * (1 if a.const else 2)),
         chunk=CHUNK,
         add_k=11 * a.i,
         cfg=a.i,
         fanout=a.fanout,
+        const=a.const,
         reconfig=True,
     )
     # Give each config a DISTINCT runtime-sequence symbol so an N-config fold
