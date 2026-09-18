@@ -676,6 +676,16 @@ struct AIEGenerateColumnControlOverlayPass
     // alloc represent the spine; a lone core degrades to a plain identity group.
     if (!computeGroup.empty())
       groups.push_back(computeGroup);
+    // When >1 core folded into the multicast group, ALSO emit each core as its
+    // own identity group: a native-id single-dest residual flow alongside the
+    // shared multicast flow above. The dedup pass rides COMMON writes on the
+    // multicast id and each tile's routing residual on its native id, so every
+    // core must appear in BOTH flows. A lone core needs no residual (its single
+    // flow already carries everything), so skip the split there to avoid a
+    // duplicate same-id flow to the same dest.
+    if (computeGroup.size() > 1)
+      for (auto core : computeGroup)
+        groups.push_back({core});
     for (auto &g : identityGroups)
       groups.push_back(g);
     return groups;
@@ -827,6 +837,18 @@ struct AIEGenerateColumnControlOverlayPass
           if (chosenChan != rowToShimChanMap[ct.rowIndex()])
             ct->setAttr("ctrl_pkt_shim_chan",
                         builder.getI32IntegerAttr(chosenChan));
+        // Hand the within-col multicast group down to the dedup pass: stamp the
+        // shared flow id (this representative's controller_id = ctrlPktFlowID,
+        // pre-increment) on EVERY core in the folded group. The dedup pass reads
+        // it to recover group membership + representative + shared id, then
+        // re-addresses COMMON writes to the representative (multicast id) and
+        // leaves each tile's routing residual on its native id. Only the folded
+        // group (size > 1) is a real multicast; identity/residual groups
+        // (size 1) carry no stamp.
+        if (group.size() > 1)
+          for (auto ct : group)
+            ct->setAttr("ctrl_pkt_mcast_group",
+                        builder.getI32IntegerAttr(ctrlPktFlowID));
       } else {
         chosenChan = rowToShimChanMap[tOp.rowIndex()];
         if (!llvm::is_contained(availableShimChans, chosenChan) &&
