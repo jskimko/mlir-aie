@@ -44,126 +44,123 @@ namespace {
 // Tile-LOCAL offset: the low bits below the row field. On npu2 (rowShift=20)
 // this is addr & 0xFFFFF; the col/row upper bits are excluded on purpose --
 // they are the ONLY thing allowed to differ on a common write (design sec 3).
-static uint32_t localOffset(NpuControlPacketOp cp, const AIE::AIETargetModel &tm) {
+static uint32_t localOffset(NpuControlPacketOp cp,
+                            const AIE::AIETargetModel &tm) {
   return cp.getAddress() & ((1u << tm.getRowShift()) - 1u);
-}
-
-// Address-normalized byte equivalence: same opcode, same local offset, same
-// length, byte-identical data. This IS the equivalence guard (design sec 5).
-static bool equivalent(NpuControlPacketOp a, NpuControlPacketOp b,
-                       const AIE::AIETargetModel &tm) {
-  if (a.getOpcode() != b.getOpcode())
-    return false;
-  if (localOffset(a, tm) != localOffset(b, tm))
-    return false;
-  if (a.getLength() != b.getLength())
-    return false;
-  std::optional<ArrayRef<int32_t>> da = a.getData(), db = b.getData();
-  if (da.has_value() != db.has_value())
-    return false;
-  if (da && *da != *db)
-    return false;
-  return true;
-}
-
-// Semantic register name for a tile-LOCAL offset (compute tiles: "core" then
-// "memory" module). Empty if the offset is not in the database. Used only for a
-// SOFT diagnostic on UNIQUE writes -- classification does NOT depend on it.
-static StringRef registerName(uint32_t off, const AIE::RegisterDatabase *db) {
-  if (!db)
-    return {};
-  for (StringRef mod : {"core", "memory"})
-    if (const AIE::RegisterInfo *r = db->lookupRegisterByOffset(off, mod))
-      return r->name;
-  return {};
 }
 
 struct AIECtrlPacketDedupMulticastPass
     : xilinx::AIEX::impl::AIECtrlPacketDedupMulticastBase<
           AIECtrlPacketDedupMulticastPass> {
 
+  // A tile's applied write, address-NORMALIZED (col/row stripped): what the
+  // tile actually sees. The multicast layer must be invisible -- a tile's
+  // stream of (opcode, local offset, data) must be IDENTICAL whether a write
+  // arrived via broadcast or per-tile unicast. This snapshot is that comparison
+  // key.
+  struct Write {
+    uint32_t opc;
+    uint32_t off;
+    SmallVector<int32_t> data;
+    bool operator==(const Write &o) const {
+      return opc == o.opc && off == o.off && data == o.data;
+    }
+  };
+  static Write snapshot(NpuControlPacketOp cp, const AIE::AIETargetModel &tm) {
+    SmallVector<int32_t> d;
+    if (auto da = cp.getData())
+      d.assign(da->begin(), da->end());
+    return {cp.getOpcode(), localOffset(cp, tm), std::move(d)};
+  }
+
   // Process one multicast group's packets within one phase (config OR enable).
   // perTile is ordered [member][program-order], member[0] = representative
-  // (lowest row => earliest block position after the sort pass). Alignment is
-  // OFFSET-KEYED, NOT positional (design sec 3 + sec 8 risk 3): the lower core's
-  // switchbox passes upper cores' streams through, so it emits EXTRA pass-through
-  // routing packets -> the tiles have UNEQUAL counts (e.g. 76 vs 84). Never
-  // require equal counts; match by local offset instead.
+  // (lowest row => earliest block position after the sort pass).
+  //
+  // Reconfiguration is an ORDERED sequence with mandatory quiescence
+  // boundaries: reset/disable -> write program memory -> DMA/BD, then (enable
+  // phase) enable last. Each member's stream is a byte-identical COMMON PREFIX
+  // -- that whole quiesce+config run, IN ORDER, including the repeated
+  // Core_Control reset pulse 0/2/0 -- followed by a per-tile RESIDUAL
+  // (stream-switch routing, whose count AND common/unique interleave differ per
+  // tile: the lower core's switchbox passes upper cores through).
+  //
+  // We broadcast the maximal common POSITIONAL PREFIX and keep the entire
+  // residual per-tile. Deletion-only: tag the representative's prefix copy with
+  // the spare id (delivered ONCE, forked to every member) and drop the others'.
+  // Because the representative's block precedes every member's, the broadcast
+  // prefix lands BEFORE any member's residual, so every member is quiesced by
+  // the prefix's leading reset before the program memory the prefix carries --
+  // i.e. each member sees EXACTLY its p2p stream (prefix then its own
+  // residual).
+  //
+  // Why prefix-only, not offset-set: the earlier offset-set collapse (a) forced
+  // the repeated-offset reset UNIQUE, severing it from its run so program
+  // memory hit an un-quiesced core (device wedge), and (b) front-loaded the
+  // residual's interleaved common switch writes, re-ordering a member's stream.
+  // A positional prefix keeps the reset in its run and never reorders a
+  // residual; the residual's few common switch writes are simply left per-tile
+  // (negligible payload, and the invariant gate below proves each member's
+  // stream is unchanged).
   LogicalResult dedupPhase(ArrayRef<SmallVector<NpuControlPacketOp>> perTile,
                            uint32_t spareId, const AIE::AIETargetModel &tm,
                            const AIE::RegisterDatabase *db, OpBuilder &b) {
+    (void)db;
     unsigned n = perTile.size();
     if (n < 2)
       return success();
 
-    // Per-tile local-offset -> packets, keeping each tile's program order. std
-    // ordered containers give a deterministic offset walk.
-    SmallVector<std::map<uint32_t, SmallVector<NpuControlPacketOp>>> byOff(n);
-    std::set<uint32_t> allOffsets;
+    // p2p reference: each member's ORIGINAL applied sequence, before deletion.
+    SmallVector<SmallVector<Write>> orig(n);
     for (unsigned t = 0; t < n; ++t)
-      for (NpuControlPacketOp cp : perTile[t]) {
-        uint32_t o = localOffset(cp, tm);
-        byOff[t][o].push_back(cp);
-        allOffsets.insert(o);
-      }
+      for (NpuControlPacketOp cp : perTile[t])
+        orig[t].push_back(snapshot(cp, tm));
 
-    for (uint32_t o : allOffsets) {
-      // COMMON iff present on ALL N tiles, exactly once each, and byte-identical
-      // (address-normalized). A duplicated offset (>1 on some tile) is not
-      // collapsible positionally, so treat it as UNIQUE.
-      bool onAllOnce = true;
-      for (unsigned t = 0; t < n && onAllOnce; ++t) {
-        auto it = byOff[t].find(o);
-        onAllOnce = it != byOff[t].end() && it->second.size() == 1;
-      }
-      bool common = onAllOnce;
-      if (common) {
-        NpuControlPacketOp rep = byOff[0][o].front();
-        for (unsigned t = 1; t < n && common; ++t)
-          common = equivalent(rep, byOff[t][o].front(), tm);
-      }
+    // Maximal common positional prefix: the leading run where every member has
+    // a byte-identical (address-normalized) write at the same position. The
+    // per-tile residual begins at the first divergence.
+    size_t minLen = orig[0].size();
+    for (unsigned t = 1; t < n; ++t)
+      minLen = std::min(minLen, orig[t].size());
+    size_t prefix = 0;
+    while (prefix < minLen) {
+      bool allEq = true;
+      for (unsigned t = 1; t < n && allEq; ++t)
+        allEq = orig[t][prefix] == orig[0][prefix];
+      if (!allEq)
+        break;
+      ++prefix;
+    }
 
-      if (common) {
-        // Collapse: keep the representative's packet (earliest program
-        // position) tagged with the spare multicast id; drop the other N-1
-        // copies. Keep its native address -- AITargetNPU bakes mcast_pkt_id as
-        // the routing id (CORRECTION). Deletion-only: each surviving packet
-        // stays in place, so per-tile program order + the phase boundary hold.
-        byOff[0][o].front()->setAttr("mcast_pkt_id",
-                                     b.getUI32IntegerAttr(spareId));
-        for (unsigned t = 1; t < n; ++t)
-          byOff[t][o].front().erase();
-      } else {
-        // UNIQUE: present on some-but-not-all tiles, OR divergent data, OR
-        // duplicated -- e.g. per-tile output routing (stream-switch) or per-tile
-        // output BUFFER ADDRESS (DMA_BD). Kept per-tile in place (native
-        // address, no mcast_pkt_id): a UNIQUE packet is NEVER multicast, it
-        // rides that tile's OWN native-id residual flow to that tile only
-        // (guaranteed available by Task 6 -- every core in a within-col group
-        // gets its own native-id residual flow). So a divergent write of ANY
-        // register class is delivered correctly per-tile; there is no
-        // correctness reason to fail loud. Deletion-only touches only COMMON, so
-        // nothing to do here except an optional soft heads-up.
-        //
-        // SOFT diagnostic (remark, not error -- does not block the build): a
-        // divergent PROGRAM-MEMORY write is unexpected for a same-kernel group
-        // and just means less dedup (still correct).
-        if (registerName(o, db).starts_with("Program")) {
-          NpuControlPacketOp anchor;
-          for (unsigned t = 0; t < n; ++t) {
-            auto it = byOff[t].find(o);
-            if (it != byOff[t].end()) {
-              anchor = it->second.front();
-              break;
-            }
-          }
-          anchor.emitRemark()
-              << "within-col dedup: divergent program-memory write at local "
-                 "offset 0x"
-              << llvm::utohexstr(o)
-              << " kept per-tile (unexpected for a same-kernel group; reduces "
-                 "dedup but is correct)";
-        }
+    // Broadcast the prefix: tag the representative's copies, drop the others'.
+    for (size_t i = 0; i < prefix; ++i) {
+      NpuControlPacketOp rep = perTile[0][i];
+      rep->setAttr("mcast_pkt_id", b.getUI32IntegerAttr(spareId));
+      for (unsigned t = 1; t < n; ++t) {
+        NpuControlPacketOp dup = perTile[t][i];
+        dup.erase();
+      }
+    }
+
+    // INVARIANT GATE (the multicast layer must be invisible). Reconstruct each
+    // member's applied stream -- [rep prefix] ++ [member residual] -- and
+    // require it EQUALS its p2p sequence. It does by construction for a
+    // positional prefix; asserting it means any future shape change
+    // (interleaved / reordered common runs) fails loud at build instead of
+    // emitting a mis-ordered reconfiguration stream (the exact class of defect
+    // that wedged on device).
+    for (unsigned t = 1; t < n; ++t) {
+      SmallVector<Write> recon(orig[0].begin(), orig[0].begin() + prefix);
+      recon.append(orig[t].begin() + prefix, orig[t].end());
+      if (recon.size() != orig[t].size() ||
+          !std::equal(recon.begin(), recon.end(), orig[t].begin())) {
+        NpuControlPacketOp anchor = perTile[0].front(); // rep never erased
+        return anchor.emitOpError()
+               << "within-col dedup: broadcast would change member " << t
+               << "'s applied control-packet stream; the group is not a "
+                  "common-prefix/per-tile-residual shape the broadcast can "
+                  "preserve -- refusing to emit a mis-ordered reconfiguration "
+                  "stream";
       }
     }
     return success();
@@ -186,8 +183,9 @@ struct AIECtrlPacketDedupMulticastPass
 
     // Load the register database only once we know there is a group to process,
     // so a non-broadcast build (no stamps -> inert pass, Task 9 wires this into
-    // every build) pays no JSON parse. getRegisterDatabase() on the target model
-    // is protected; the public static loader gives the same AIE2 db (npu2).
+    // every build) pays no JSON parse. getRegisterDatabase() on the target
+    // model is protected; the public static loader gives the same AIE2 db
+    // (npu2).
     std::unique_ptr<AIE::RegisterDatabase> dbOwner =
         AIE::RegisterDatabase::loadAIE2();
     const AIE::RegisterDatabase *db = dbOwner.get();
