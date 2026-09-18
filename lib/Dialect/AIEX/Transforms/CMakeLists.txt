@@ -23,6 +23,7 @@ add_mlir_dialect_library(AIEXTransforms
   AIEDMATasksToNPU.cpp
   AIESubstituteShimDMAAllocations.cpp
   AIECtrlPacketToDma.cpp
+  AIECtrlPacketDedupMulticast.cpp
   AIESortControlPacketsByTile.cpp
   AIELowerSetLock.cpp
   AIELowerDmaChannelReset.cpp

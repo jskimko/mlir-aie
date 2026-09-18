@@ -52,6 +52,8 @@ createAIECtrlPacketToDmaPass();
 std::unique_ptr<mlir::OperationPass<AIE::DeviceOp>>
 createAIESortControlPacketsByTilePass();
 std::unique_ptr<mlir::OperationPass<AIE::DeviceOp>>
+createAIECtrlPacketDedupMulticastPass();
+std::unique_ptr<mlir::OperationPass<AIE::DeviceOp>>
 createAIECtrlPacketInferTilesPass();
 std::unique_ptr<mlir::OperationPass<AIE::DeviceOp>> createAIELowerSetLockPass();
 std::unique_ptr<mlir::OperationPass<AIE::DeviceOp>>

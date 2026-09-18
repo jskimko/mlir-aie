@@ -391,6 +391,38 @@ def AIESortControlPacketsByTile
   let dependentDialects = ["xilinx::AIEX::AIEXDialect", "xilinx::AIE::AIEDialect"];
 }
 
+def AIECtrlPacketDedupMulticast
+    : Pass<"aie-ctrlpkt-dedup-multicast", "AIE::DeviceOp"> {
+  let summary = "Collapse a within-col control-multicast group's COMMON control "
+                "packets to one multicast-id packet; keep per-tile routing "
+                "residuals.";
+  let description = [{
+    Runs at the shared control-packet producer, AFTER
+    `aie-sort-control-packets-by-tile` (which makes each tile's packets
+    contiguous + identically ordered across the group). Per column, per
+    multicast group (recovered from the overlay's `ctrl_pkt_mcast_group` tile
+    stamps = members + spare id), the N per-tile control-packet blocks are
+    aligned BY LOCAL OFFSET (`addr & 0xFFFFF`), not by index. A position is
+    COMMON iff every member's packet there has the same opcode + same local
+    offset + same length + byte-identical data (only the col/row upper address
+    bits may differ); else UNIQUE. Each COMMON position collapses to ONE packet
+    tagged `mcast_pkt_id` = the group's spare id (rides the shared multicast
+    flow); each UNIQUE position stays per-tile on its native id (the routing
+    residual). The byte-compare IS the equivalence guard; a divergent UNIQUE
+    write that does NOT resolve to a stream-switch register
+    (`RegisterDatabase::lookupRegisterByOffset`) is unsafe to multicast and
+    fails loud, as does any non-alignable block (differing offset sequence).
+    A single forward walk (delete + tag only, never reorder) preserves program
+    order and the config/enable phase boundary. No-op unless the overlay stamped
+    a group (i.e. under `control-broadcast=within-col`).
+  }];
+  let constructor = "xilinx::AIEX::createAIECtrlPacketDedupMulticastPass()";
+  let dependentDialects = [
+    "xilinx::AIE::AIEDialect",
+    "xilinx::AIEX::AIEXDialect",
+  ];
+}
+
 def AIECtrlPacketInferTiles : Pass<"aie-ctrl-packet-infer-tiles", "AIE::DeviceOp"> {
   let summary = "Infer aie.tile ops from aiex.control_packet addresses";
 
